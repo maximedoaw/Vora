@@ -8,9 +8,18 @@
     "scheme": "vora",
     "userInterfaceStyle": "automatic",
     "ios": {
-      "icon": "./assets/expo.icon"
+      "icon": "./assets/expo.icon",
+      "bundleIdentifier": "com.vora.app",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "Vora a besoin de ta position pour te placer sur la carte et calculer un itinéraire."
+      }
     },
     "android": {
+      "package": "com.vora.app",
+      "permissions": [
+        "android.permission.ACCESS_COARSE_LOCATION",
+        "android.permission.ACCESS_FINE_LOCATION"
+      ],
       "adaptiveIcon": {
         "backgroundColor": "#E6F4FE",
         "foregroundImage": "./assets/images/android-icon-foreground.png",
@@ -31,6 +40,14 @@
           "backgroundColor": "#208AEF",
           "image": "./assets/images/splash-icon.png",
           "imageWidth": 76
+        }
+      ],
+      "@clerk/expo",
+      "expo-secure-store",
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Vora a besoin de ta position pour te placer sur la carte et calculer un itinéraire."
         }
       ]
     ],
