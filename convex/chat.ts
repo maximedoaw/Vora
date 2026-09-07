@@ -1,7 +1,9 @@
 import { v } from "convex/values";
 
+import { internal } from "./_generated/api";
 import { mutation, query, type QueryCtx } from "./_generated/server";
-import { currentUser } from "./users";
+import type { RideStatus } from "./rides";
+import { currentUser } from "./model/auth";
 import type { Doc, Id } from "./_generated/dataModel";
 
 export const MAX_MESSAGE_LENGTH = 2000;
@@ -19,6 +21,9 @@ export type ChatMessage = {
   lat?: number;
   lng?: number;
   placeName?: string;
+  /** Course née de ce partage de position, si le chauffeur est un vrai compte. */
+  rideId?: Id<"rides">;
+  rideStatus?: RideStatus;
 };
 
 export type ConversationSummary = {
@@ -210,16 +215,25 @@ export const listMessages = query({
       .order("asc")
       .collect();
 
-    return messages.map((message) => ({
-      id: message._id,
-      body: message.body,
-      mine: message.senderId === found.me._id,
-      sentAt: message._creationTime,
-      kind: message.kind === "location" ? ("location" as const) : ("text" as const),
-      lat: message.lat,
-      lng: message.lng,
-      placeName: message.placeName,
-    }));
+    return Promise.all(
+      messages.map(async (message) => {
+        // Le statut est relu à chaque rendu : le widget suit la course en direct.
+        const ride = message.rideId ? await ctx.db.get(message.rideId) : null;
+
+        return {
+          id: message._id,
+          body: message.body,
+          mine: message.senderId === found.me._id,
+          sentAt: message._creationTime,
+          kind: message.kind === "location" ? ("location" as const) : ("text" as const),
+          lat: message.lat,
+          lng: message.lng,
+          placeName: message.placeName,
+          rideId: ride?._id,
+          rideStatus: ride?.status,
+        };
+      }),
+    );
   },
 });
 
@@ -257,9 +271,14 @@ export const sendMessage = mutation({
 /**
  * Partage la position de l'expéditeur dans le fil.
  *
+ * Quand c'est le **passager** qui partage et que le fil vise un vrai compte
+ * chauffeur, une course `requested` est créée dans la foulée : le chauffeur
+ * pourra l'accepter ou la refuser depuis le message. Un fil ouvert avec un
+ * profil de test n'en crée aucune — personne ne pourrait y répondre.
+ *
  * Le message reste lisible tel quel (`body`) pour les aperçus et les lecteurs
- * d'écran ; les coordonnées servent au tracé vers le client. Au passage, la
- * position du compte est rafraîchie : partager, c'est se déclarer ici et maintenant.
+ * d'écran. Au passage, la position du compte est rafraîchie : partager, c'est
+ * se déclarer ici et maintenant.
  */
 export const shareLocation = mutation({
   args: {
@@ -267,8 +286,12 @@ export const shareLocation = mutation({
     lat: v.number(),
     lng: v.number(),
     placeName: v.optional(v.string()),
+    /** Destination en cours côté passager, si la discussion vient de la carte. */
+    destLat: v.optional(v.number()),
+    destLng: v.optional(v.number()),
+    destName: v.optional(v.string()),
   },
-  handler: async (ctx, { conversationId, lat, lng, placeName }) => {
+  handler: async (ctx, { conversationId, lat, lng, placeName, destLat, destLng, destName }) => {
     const found = await participantIn(ctx, conversationId);
     if (!found) throw new Error("Discussion introuvable.");
 
@@ -279,6 +302,37 @@ export const shareLocation = mutation({
     const place = placeName?.trim() || undefined;
     const now = Date.now();
 
+    // `normalizeId` renvoie `null` pour un `demo-driver-N` : pas de vrai chauffeur.
+    const driverId =
+      found.side === "rider" ? ctx.db.normalizeId("users", found.conversation.driverKey) : null;
+
+    // Destination explicite si le fil vient de la carte, sinon celle mémorisée
+    // sur le profil du passager lors de son choix de lieu.
+    const rider = found.side === "rider" ? found.me : await ctx.db.get(found.conversation.riderId);
+    const fallbackLat = rider?.pendingDestLat;
+    const fallbackLng = rider?.pendingDestLng;
+
+    const toLat = destLat ?? fallbackLat;
+    const toLng = destLng ?? fallbackLng;
+    const destination =
+      toLat != null && toLng != null && Math.abs(toLat) <= 90 && Math.abs(toLng) <= 180
+        ? { lat: toLat, lng: toLng }
+        : undefined;
+
+    const destinationLabel = destName?.trim() || rider?.pendingDestName;
+
+    const rideId = driverId
+      ? await ctx.db.insert("rides", {
+          riderId: found.conversation.riderId,
+          conversationId,
+          status: "requested",
+          pickup: { lat, lng },
+          pickupName: place,
+          destination,
+          destinationName: destination ? destinationLabel || undefined : undefined,
+        })
+      : undefined;
+
     await ctx.db.insert("messages", {
       conversationId,
       senderId: found.me._id,
@@ -287,6 +341,7 @@ export const shareLocation = mutation({
       lat,
       lng,
       placeName: place,
+      rideId,
     });
 
     await ctx.db.patch(conversationId, {
@@ -295,6 +350,21 @@ export const shareLocation = mutation({
     });
 
     await ctx.db.patch(found.me._id, { lastLat: lat, lastLng: lng, lastPositionAt: now });
+
+    // Sans cette alerte, le chauffeur ne découvrirait la demande qu'en ouvrant
+    // l'application — le passager attendrait pour rien.
+    if (rideId && driverId) {
+      await ctx.scheduler.runAfter(0, internal.push.send, {
+        userId: driverId,
+        title: "Nouvelle demande de course",
+        body: place
+          ? `${found.me.name} t'attend à ${place}.`
+          : `${found.me.name} a partagé sa position.`,
+        url: `/ride/${rideId}`,
+      });
+    }
+
+    return rideId ?? null;
   },
 });
 

@@ -13,17 +13,33 @@ import {
 export function AuthField({
   label,
   hint,
+  prefix,
   ...inputProps
-}: TextInputProps & { label: string; hint?: string }) {
+}: TextInputProps & { label: string; hint?: string; prefix?: string }) {
   return (
     <View style={styles.fieldWrapper}>
       <Text style={styles.label}>{label}</Text>
-      <TextInput
-        placeholderTextColor="#6f6f6f"
-        selectionColor="#1ED760"
-        {...inputProps}
-        style={[styles.input, inputProps.style]}
-      />
+
+      {prefix ? (
+        // Indicatif figé : il n'est ni saisi ni modifiable, seulement rappelé.
+        <View style={styles.prefixedField}>
+          <Text style={styles.prefix}>{prefix}</Text>
+          <TextInput
+            placeholderTextColor="#6f6f6f"
+            selectionColor="#1ED760"
+            {...inputProps}
+            style={[styles.prefixedInput, inputProps.style]}
+          />
+        </View>
+      ) : (
+        <TextInput
+          placeholderTextColor="#6f6f6f"
+          selectionColor="#1ED760"
+          {...inputProps}
+          style={[styles.input, inputProps.style]}
+        />
+      )}
+
       {hint ? <Text style={styles.hint}>{hint}</Text> : null}
     </View>
   );
@@ -149,6 +165,30 @@ export const styles = StyleSheet.create({
     borderColor: '#3a3a3a',
     backgroundColor: '#121212',
     paddingHorizontal: 16,
+    color: '#fff',
+    fontSize: 16,
+  },
+  prefixedField: {
+    alignSelf: 'stretch',
+    flexDirection: 'row',
+    alignItems: 'center',
+    height: 52,
+    borderRadius: 14,
+    borderWidth: 1,
+    borderColor: '#3a3a3a',
+    backgroundColor: '#121212',
+    paddingLeft: 16,
+  },
+  prefix: {
+    color: '#8a8a8a',
+    fontSize: 16,
+    fontWeight: '700',
+    marginRight: 10,
+  },
+  prefixedInput: {
+    flex: 1,
+    height: '100%',
+    paddingRight: 16,
     color: '#fff',
     fontSize: 16,
   },

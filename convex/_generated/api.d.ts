@@ -11,6 +11,10 @@
 import type * as chat from "../chat.js";
 import type * as drivers from "../drivers.js";
 import type * as http from "../http.js";
+import type * as model_auth from "../model/auth.js";
+import type * as model_phone from "../model/phone.js";
+import type * as push from "../push.js";
+import type * as rides from "../rides.js";
 import type * as routing from "../routing.js";
 import type * as users from "../users.js";
 
@@ -24,6 +28,10 @@ declare const fullApi: ApiFromModules<{
   chat: typeof chat;
   drivers: typeof drivers;
   http: typeof http;
+  "model/auth": typeof model_auth;
+  "model/phone": typeof model_phone;
+  push: typeof push;
+  rides: typeof rides;
   routing: typeof routing;
   users: typeof users;
 }>;

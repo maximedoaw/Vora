@@ -96,6 +96,9 @@ export const VoraColors = {
     dangerBorder: 'rgba(179,38,30,0.35)',
     mapBackground: '#e9eaee',
     scrim: 'rgba(0,0,0,0.06)',
+    /** Or des étoiles de notation : identique dans les deux thèmes. */
+    star: '#F5B301',
+    starEmpty: '#c9ccd3',
   },
   dark: {
     background: '#000000',
@@ -124,6 +127,8 @@ export const VoraColors = {
     dangerBorder: 'rgba(255,79,79,0.45)',
     mapBackground: '#111111',
     scrim: 'rgba(0,0,0,0.35)',
+    star: '#F5B301',
+    starEmpty: '#3a3a3a',
   },
 } as const;
 

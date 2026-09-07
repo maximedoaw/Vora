@@ -1,5 +1,8 @@
 import { v } from "convex/values";
 import { internalMutation, mutation, query, type QueryCtx } from "./_generated/server";
+import { currentUser, userByClerkId } from "./model/auth";
+import { normalizePhone, phoneError } from "./model/phone";
+import { trackDriver } from "./rides";
 
 export const MIN_NAME_LENGTH = 2;
 export const MAX_NAME_LENGTH = 40;
@@ -13,25 +16,6 @@ type ClerkUserPayload = {
   email_addresses?: { id: string; email_address: string }[];
   primary_email_address_id?: string | null;
 };
-
-/** Recherche par identifiant Clerk (index `by_clerk_id`). */
-async function userByClerkId(ctx: QueryCtx, clerkId: string) {
-  return ctx.db
-    .query("users")
-    .withIndex("by_clerk_id", (q) => q.eq("clerkId", clerkId))
-    .unique();
-}
-
-/**
- * Utilisateur Convex correspondant au JWT Clerk courant, ou `null`.
- * Exporté comme simple helper (pas une fonction Convex) : réutilisé par
- * `drivers.ts` pour vérifier que l'appelant est bien un passager.
- */
-export async function currentUser(ctx: QueryCtx) {
-  const identity = await ctx.auth.getUserIdentity();
-  if (!identity) return null;
-  return userByClerkId(ctx, identity.subject);
-}
 
 function normalizeName(name: string) {
   return name.trim();
@@ -119,9 +103,11 @@ export const completeOnboarding = mutation({
   args: {
     role: v.union(v.literal("rider"), v.literal("driver")),
     name: v.string(),
+    /** 9 chiffres locaux ou forme complète : normalisé en `+237…`. */
+    phone: v.string(),
     vehicle: v.optional(v.object({ type: v.string(), plate: v.string() })),
   },
-  handler: async (ctx, { role, name, vehicle }) => {
+  handler: async (ctx, { role, name, phone, vehicle }) => {
     const user = await currentUser(ctx);
     if (!user) throw new Error("Utilisateur introuvable — sync d'abord.");
 
@@ -138,7 +124,18 @@ export const completeOnboarding = mutation({
       throw new Error("Ce nom d'utilisateur est déjà pris.");
     }
 
-    await ctx.db.patch(user._id, { role, name: cleanName, nameLower: key });
+    // Obligatoire pour tous : un chauffeur doit être payable, un passager
+    // joignable, et le paiement mobile passe par ce numéro dans les deux sens.
+    const phoneProblem = phoneError(phone);
+    if (phoneProblem) throw new Error(phoneProblem);
+    const cleanPhone = normalizePhone(phone)!;
+
+    await ctx.db.patch(user._id, {
+      role,
+      name: cleanName,
+      nameLower: key,
+      phone: cleanPhone,
+    });
 
     if (role !== "driver") return;
 
@@ -191,10 +188,51 @@ export const updatePosition = mutation({
 
     const now = Date.now();
     const last = user.lastPositionAt ?? 0;
-    if (!immediate && now - last < POSITION_MIN_INTERVAL_MS) return user.lastPositionAt ?? null;
+    const tooSoon = !immediate && now - last < POSITION_MIN_INTERVAL_MS;
+
+    // Une course en cours prime sur le rythme d'économie : le passager doit
+    // voir son chauffeur avancer, pas sauter toutes les deux minutes.
+    if (user.role === "driver") await trackDriver(ctx, user._id, lat, lng);
+
+    if (tooSoon) return user.lastPositionAt ?? null;
 
     await ctx.db.patch(user._id, { lastLat: lat, lastLng: lng, lastPositionAt: now });
     return now;
+  },
+});
+
+/**
+ * Mémorise la destination choisie par le passager sur la carte.
+ *
+ * Sans argument, elle est effacée. La garder en base — plutôt que de la trimballer
+ * dans les paramètres de navigation — permet à une course créée depuis un fil
+ * rouvert d'avoir malgré tout son point d'arrivée.
+ */
+export const setDestination = mutation({
+  args: {
+    lat: v.optional(v.number()),
+    lng: v.optional(v.number()),
+    name: v.optional(v.string()),
+  },
+  handler: async (ctx, { lat, lng, name }) => {
+    const user = await currentUser(ctx);
+    if (!user) return null;
+
+    const valid =
+      lat != null &&
+      lng != null &&
+      Number.isFinite(lat) &&
+      Number.isFinite(lng) &&
+      Math.abs(lat) <= 90 &&
+      Math.abs(lng) <= 180;
+
+    await ctx.db.patch(user._id, {
+      pendingDestLat: valid ? lat : undefined,
+      pendingDestLng: valid ? lng : undefined,
+      pendingDestName: valid ? name?.trim() || undefined : undefined,
+    });
+
+    return valid;
   },
 });
 

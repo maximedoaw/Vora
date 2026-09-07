@@ -1,4 +1,4 @@
-import { useQuery } from 'convex/react';
+import { useMutation, useQuery } from 'convex/react';
 import { router } from 'expo-router';
 import * as SplashScreen from 'expo-splash-screen';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
@@ -7,6 +7,7 @@ import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import type { VoraPalette } from '@/constants/theme';
 import { useGeo } from '@/hooks/use-geo';
+import { Avatar, useMyAvatarUri } from '@/components/avatar';
 import { InboxButton } from '@/components/inbox-button';
 import { DriverSuggestions } from '@/components/map/driver-suggestions';
 import { MapOverlay } from '@/components/map/map-overlay';
@@ -15,6 +16,7 @@ import type { MapCameraHandle, MapDriver } from '@/components/map/native-map-sha
 import { PlaceSearch } from '@/components/map/place-search';
 import { RouteInfoCard } from '@/components/map/route-info-card';
 import { useAppTheme } from '@/hooks/use-app-theme';
+import { rideStatusColor, rideStatusLabel } from '@/lib/rides';
 import { useDrivers } from '@/hooks/use-drivers';
 import { useRoute } from '@/hooks/use-route';
 import { useSettledOrigin } from '@/hooks/use-settled-origin';
@@ -48,6 +50,9 @@ export function RideMapScreen() {
   const [driver, setDriver] = useState<RideDriver | null>(null);
   const me = useQuery(api.users.getMe);
   const isRider = me?.role === 'rider';
+  const activeRide = useQuery(api.rides.activeForMe, {});
+  const avatarUri = useMyAvatarUri();
+  const rememberDestination = useMutation(api.users.setDestination);
 
   const posLng = geo.position?.lng;
   const posLat = geo.position?.lat;
@@ -122,21 +127,40 @@ export function RideMapScreen() {
     mapRef.current?.fitRoute(route.geometry.coordinates);
   }, [destination, route]);
 
-  const handlePlaceSelect = useCallback((place: GeocodeFeature) => {
-    setDestination(place);
-    setDriver(null);
-    fittedFor.current = null;
-    const pos = geoPositionRef.current;
-    if (pos) setPickup([pos.lng, pos.lat]);
-    mapRef.current?.flyTo(place.center[0], place.center[1], FIRST_FIX_ZOOM);
-  }, []);
+  const handlePlaceSelect = useCallback(
+    (place: GeocodeFeature) => {
+      setDestination(place);
+      setDriver(null);
+      fittedFor.current = null;
+      const pos = geoPositionRef.current;
+      if (pos) setPickup([pos.lng, pos.lat]);
+
+      // Le lieu choisi est retenu en base : toute course lancée ensuite,
+      // depuis n'importe quel fil, saura où le passager veut aller.
+      if (isRider) {
+        void rememberDestination({
+          lat: place.center[1],
+          lng: place.center[0],
+          name: place.text,
+        }).catch((error) => console.warn('[destination] non enregistrée', error));
+      }
+
+      mapRef.current?.flyTo(place.center[0], place.center[1], FIRST_FIX_ZOOM);
+    },
+    [isRider, rememberDestination],
+  );
 
   const clearDestination = useCallback(() => {
     setDestination(null);
     setPickup(null);
     setDriver(null);
     fittedFor.current = null;
-  }, []);
+    if (isRider) {
+      void rememberDestination({}).catch((error) =>
+        console.warn('[destination] non effacée', error),
+      );
+    }
+  }, [isRider, rememberDestination]);
 
   const toggleDriver = useCallback(
     (next: RideDriver) => {
@@ -150,15 +174,29 @@ export function RideMapScreen() {
     [driver],
   );
 
-  /** Ouvre le fil de discussion dédié au chauffeur. */
-  const openChat = useCallback((next: RideDriver) => {
-    const type = resolveVehicleType(next.vehicle?.type ?? '');
-    const plate = next.vehicle?.plate ? ` · ${next.vehicle.plate}` : '';
-    router.push({
-      pathname: '/chat/[driverKey]',
-      params: { driverKey: next.id, name: next.name, vehicle: `${type.label}${plate}` },
-    });
-  }, []);
+  /**
+   * Ouvre le fil de discussion dédié au chauffeur.
+   * La destination choisie voyage avec : c'est le seul moment où on la connaît,
+   * et elle servira à la course créée depuis la discussion.
+   */
+  const openChat = useCallback(
+    (next: RideDriver) => {
+      const type = resolveVehicleType(next.vehicle?.type ?? '');
+      const plate = next.vehicle?.plate ? ` · ${next.vehicle.plate}` : '';
+      router.push({
+        pathname: '/chat/[driverKey]',
+        params: {
+          driverKey: next.id,
+          name: next.name,
+          vehicle: `${type.label}${plate}`,
+          destLng: destination ? String(destination.center[0]) : '',
+          destLat: destination ? String(destination.center[1]) : '',
+          destName: destination?.text ?? '',
+        },
+      });
+    },
+    [destination],
+  );
 
   const driverVehicle = driver ? resolveVehicleType(driver.vehicle?.type ?? '') : null;
 
@@ -198,15 +236,35 @@ export function RideMapScreen() {
                   accessibilityLabel="Mon compte"
                   onPress={() => router.push('/profile')}
                   hitSlop={8}
-                  style={({ pressed }) => [styles.profile, pressed && styles.pressed]}>
-                  <Text style={styles.profileLabel}>
-                    {(me?.name ?? '?').charAt(0).toUpperCase()}
-                  </Text>
+                  style={({ pressed }) => pressed && styles.pressed}>
+                  <Avatar uri={avatarUri} name={me?.name} size={34} />
                 </Pressable>
               </View>
             }
           />
         </View>
+
+        {/* Une course en cours reste à un geste, sans passer par la discussion. */}
+        {activeRide ? (
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel={`Suivre la course avec ${activeRide.counterpart}`}
+            onPress={() =>
+              router.push({ pathname: '/ride/[rideId]', params: { rideId: activeRide.id } })
+            }
+            style={({ pressed }) => [styles.rideBanner, pressed && styles.pressed]}>
+            <View
+              style={[
+                styles.rideDot,
+                { backgroundColor: rideStatusColor(activeRide.status, colors) },
+              ]}
+            />
+            <Text style={styles.rideBannerText} numberOfLines={1}>
+              {rideStatusLabel(activeRide.status, activeRide.asDriver)} · {activeRide.counterpart}
+            </Text>
+            <Text style={styles.rideBannerLink}>Suivre</Text>
+          </Pressable>
+        ) : null}
 
         <MapOverlay geo={geo} onRecenter={recenter} raised={!!destination} />
 
@@ -253,25 +311,39 @@ const createStyles = (c: VoraPalette) =>
       alignSelf: 'stretch',
       zIndex: 3,
     },
+    rideBanner: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      gap: 8,
+      marginTop: 8,
+      backgroundColor: c.surface,
+      borderRadius: 14,
+      borderWidth: 1,
+      borderColor: c.border,
+      paddingHorizontal: 12,
+      paddingVertical: 10,
+      zIndex: 2,
+    },
+    rideDot: {
+      width: 8,
+      height: 8,
+      borderRadius: 4,
+    },
+    rideBannerText: {
+      flex: 1,
+      color: c.text,
+      fontSize: 13,
+      fontWeight: '700',
+    },
+    rideBannerLink: {
+      color: c.accent,
+      fontSize: 13,
+      fontWeight: '800',
+    },
     trailingButtons: {
       flexDirection: 'row',
       alignItems: 'center',
       gap: 8,
-    },
-    profile: {
-      width: 34,
-      height: 34,
-      borderRadius: 17,
-      backgroundColor: c.surfaceStrong,
-      borderWidth: 1,
-      borderColor: c.borderStrong,
-      alignItems: 'center',
-      justifyContent: 'center',
-    },
-    profileLabel: {
-      color: c.accent,
-      fontSize: 14,
-      fontWeight: '800',
     },
     pressed: {
       opacity: 0.75,

@@ -2,6 +2,7 @@ import { useClerk } from '@clerk/expo';
 import { useMutation, useQuery } from 'convex/react';
 import { router } from 'expo-router';
 import {
+  CarFront,
   ChevronDown,
   ChevronLeft,
   ChevronRight,
@@ -22,10 +23,14 @@ import {
 } from 'react-native';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
+import { Avatar, useMyAvatarUri } from '@/components/avatar';
 import { formatUnread } from '@/components/inbox-button';
+import { StarRating } from '@/components/star-rating';
 import type { ColorScheme, VoraPalette } from '@/constants/theme';
 import { useAppTheme } from '@/hooks/use-app-theme';
+import { useForgetDevice } from '@/hooks/use-push-token';
 import { formatDate } from '@/lib/datetime';
+import { formatPhone } from '@/lib/phone';
 import { resolveVehicleType } from '@/lib/vehicles';
 import { api } from '../../convex/_generated/api';
 
@@ -44,7 +49,7 @@ const FAQ: { question: string; answer: string }[] = [
   {
     question: 'Comment le prix affiché est-il calculé ?',
     answer:
-      "Sur la grille de Yaoundé : un prix minimum, un tarif au kilomètre et un tarif à la minute, propres à chaque classe de véhicule (Moto, Éco, Confort, Confort+). Le total est arrondi aux 25 FCFA supérieurs. C'est une estimation avant course : l'attente et les détours réels ne sont pas encore comptés.",
+      "Sur la grille de Yaoundé : un prix minimum, un tarif au kilomètre et un tarif à la minute, propres à chaque classe de véhicule (Moto, Éco, Confort, Confort+). Le total est arrondi aux 25 FCFA supérieurs. C'est une estimation avant course : l'attente et les détours réels ne sont pas encore comptés. En fin de course, le passager règle ce montant au chauffeur par Orange Money ou MTN Mobile Money, sur le numéro renseigné à l'inscription.",
   },
   {
     question: 'Comment mon itinéraire est-il tracé ?',
@@ -62,9 +67,9 @@ const FAQ: { question: string; answer: string }[] = [
       "Cinq chauffeurs fictifs, éparpillés entre 250 et 900 mètres autour de toi à l'ouverture de l'application. Ils servent à essayer la sélection, le zoom sur la carte et la discussion tant qu'aucun vrai chauffeur n'est inscrit. Aucun compte réel ne se trouve derrière : ils ne répondront jamais à tes messages.",
   },
   {
-    question: 'Comment engager la conversation avec un chauffeur ?',
+    question: 'Comment se déroule une course ?',
     answer:
-      "Choisis une destination, puis touche un chauffeur dans la liste : la carte zoome sur lui et le bouton vert s'active. Il ouvre un fil de discussion qui n'appartient qu'à vous deux. Tous tes fils restent accessibles à tout moment depuis « Mes discussions », ici ou via l'icône de messagerie en haut de la carte — le chauffeur reçoit tes messages dans la sienne et peut te répondre.",
+      "Touche un chauffeur dans la liste puis le bouton vert : un fil de discussion s'ouvre. Partage-y ta position avec l'icône de repère — cela crée une demande de course que le chauffeur accepte ou refuse directement depuis le message. S'il accepte, tu le vois avancer vers toi sur la carte et tu choisis la distance à suivre : jusqu'à toi, ou jusqu'à ta destination. Chacun peut terminer ou annuler la course à tout moment, et tu notes ensuite ton chauffeur de 0 à 5 étoiles, par demi-étoile. Tout l'historique reste dans « Mes courses ».",
   },
   {
     question: 'Pourquoi Vora a-t-il besoin de ma position ?',
@@ -155,6 +160,8 @@ export default function ProfileScreen() {
   const vehicle = useQuery(api.users.getMyVehicle);
   const unread = useQuery(api.chat.unreadTotal, {}) ?? 0;
   const setAvailability = useMutation(api.users.setAvailability);
+  const avatarUri = useMyAvatarUri();
+  const forgetDevice = useForgetDevice();
   const [availabilityError, setAvailabilityError] = useState<string | null>(null);
 
   const role = me?.role ? ROLE_LABEL[me.role] : null;
@@ -185,9 +192,7 @@ export default function ProfileScreen() {
             { paddingBottom: Math.max(insets.bottom, 16) + 16 },
           ]}>
           <View style={styles.identity}>
-            <View style={styles.avatar}>
-              <Text style={styles.avatarLabel}>{me.name.charAt(0).toUpperCase()}</Text>
-            </View>
+            <Avatar uri={avatarUri} name={me.name} size={84} ring />
             <Text style={styles.name} numberOfLines={1}>
               {me.name}
             </Text>
@@ -201,14 +206,33 @@ export default function ProfileScreen() {
           <View style={styles.card}>
             <Text style={styles.cardTitle}>Coordonnées</Text>
             <Row label="E-mail" value={me.email ?? 'Non renseigné'} styles={styles} />
-            <Row label="Téléphone" value={me.phone ?? 'Non renseigné'} styles={styles} />
             <Row
-              label="Note"
-              value={me.rating == null ? 'Pas encore noté' : `★ ${me.rating.toFixed(1)}`}
+              label="Téléphone"
+              value={me.phone ? formatPhone(me.phone) : 'Non renseigné'}
               styles={styles}
             />
             <Row label="Membre depuis" value={formatDate(me._creationTime)} styles={styles} />
           </View>
+
+          {/* Seul un chauffeur est noté : un passager n'a pas de réputation à afficher. */}
+          {me.role === 'driver' ? (
+            <View style={styles.card}>
+              <Text style={styles.cardTitle}>Ma note</Text>
+              <View style={styles.ratingBlock}>
+                <StarRating value={me.rating ?? 0} size={26} />
+                <Text style={styles.ratingValue}>
+                  {me.rating == null
+                    ? 'Pas encore noté'
+                    : `${me.rating.toFixed(1).replace('.', ',')} / 5`}
+                </Text>
+                <Text style={styles.ratingCount}>
+                  {me.ratingCount
+                    ? `Moyenne sur ${me.ratingCount} course${me.ratingCount > 1 ? 's' : ''} notée${me.ratingCount > 1 ? 's' : ''}`
+                    : 'Tes passagers pourront te noter à la fin de chaque course.'}
+                </Text>
+              </View>
+            </View>
+          ) : null}
 
           {me.role === 'driver' ? (
             <View style={styles.card}>
@@ -289,6 +313,23 @@ export default function ProfileScreen() {
             <ChevronRight size={18} color={colors.textMuted} />
           </Pressable>
 
+          <Pressable
+            accessibilityRole="button"
+            accessibilityLabel="Mes courses"
+            onPress={() => router.push('/rides')}
+            style={({ pressed }) => [styles.card, styles.link, pressed && styles.pressed]}>
+            <View style={styles.linkIcon}>
+              <CarFront size={18} color={colors.accent} />
+            </View>
+            <View style={styles.linkTexts}>
+              <Text style={styles.linkTitle}>Mes courses</Text>
+              <Text style={styles.linkSub}>
+                Historique complet, en cours comme terminées ou annulées
+              </Text>
+            </View>
+            <ChevronRight size={18} color={colors.textMuted} />
+          </Pressable>
+
           <View style={styles.card}>
             <Text style={styles.cardTitle}>Apparence</Text>
             <View style={styles.schemeRow}>
@@ -334,7 +375,10 @@ export default function ProfileScreen() {
 
           <Pressable
             accessibilityRole="button"
-            onPress={() => void signOut()}
+            onPress={() =>
+              // L'appareil doit cesser de recevoir les notifications de ce compte.
+              void forgetDevice().finally(() => void signOut())
+            }
             style={({ pressed }) => [styles.signOut, pressed && styles.pressed]}>
             <Text style={styles.signOutLabel}>Se déconnecter</Text>
           </Pressable>
@@ -392,21 +436,6 @@ const createStyles = (c: VoraPalette) =>
     identity: {
       alignItems: 'center',
       gap: 10,
-    },
-    avatar: {
-      width: 84,
-      height: 84,
-      borderRadius: 42,
-      backgroundColor: c.surfaceStrong,
-      borderWidth: 2,
-      borderColor: c.accent,
-      alignItems: 'center',
-      justifyContent: 'center',
-    },
-    avatarLabel: {
-      color: c.accent,
-      fontSize: 34,
-      fontWeight: '800',
     },
     name: {
       color: c.text,
@@ -493,6 +522,22 @@ const createStyles = (c: VoraPalette) =>
       color: c.danger,
       fontSize: 12,
       paddingTop: 4,
+    },
+    ratingBlock: {
+      alignItems: 'center',
+      gap: 8,
+      paddingVertical: 6,
+    },
+    ratingValue: {
+      color: c.text,
+      fontSize: 18,
+      fontWeight: '800',
+    },
+    ratingCount: {
+      color: c.textMuted,
+      fontSize: 12,
+      lineHeight: 16,
+      textAlign: 'center',
     },
     schemeRow: {
       flexDirection: 'row',

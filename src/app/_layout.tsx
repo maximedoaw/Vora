@@ -13,6 +13,8 @@ import { GeolocationProvider } from '@/hooks/use-geo';
 import { AppThemeProvider, useAppTheme } from '@/hooks/use-app-theme';
 import { OnboardingScreen } from '@/components/onboarding-screen';
 import { WelcomeScreen } from '@/components/welcome-screen';
+import { usePushToken } from '@/hooks/use-push-token';
+import { useRideAlerts } from '@/hooks/use-ride-alerts';
 import { useStoreUser } from '@/hooks/use-store-user';
 import { api } from '../../convex/_generated/api';
 
@@ -79,6 +81,10 @@ function SyncErrorScreen({ onRetry }: { onRetry: () => void }) {
 function AuthedApp() {
   const { scheme, colors } = useAppTheme();
   const { status, retry } = useStoreUser();
+  // Montés ici et pas dans un écran : une notification peut être touchée
+  // application fermée, l'écran de destination n'existe pas encore.
+  usePushToken();
+  useRideAlerts();
   const me = useQuery(api.users.getMe);
 
   if (status === 'error') {

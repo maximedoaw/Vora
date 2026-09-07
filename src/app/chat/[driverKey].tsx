@@ -1,6 +1,16 @@
 import { useMutation, useQuery } from 'convex/react';
 import { router, useLocalSearchParams } from 'expo-router';
-import { ChevronLeft, MapPin, Navigation, Phone, Send, Video } from 'lucide-react-native';
+import {
+  Check,
+  ChevronLeft,
+  MapPin,
+  Navigation,
+  Phone,
+  Route,
+  Send,
+  Video,
+  X,
+} from 'lucide-react-native';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
@@ -21,23 +31,46 @@ import { useAppTheme } from '@/hooks/use-app-theme';
 import { useGeo } from '@/hooks/use-geo';
 import { formatDayLabel, formatTime, isSameDay } from '@/lib/datetime';
 import { reverseGeocode } from '@/lib/geocoding';
+import {
+  rideStatusColor,
+  rideStatusLabel,
+  rideStatusTint,
+  type RideStatus,
+} from '@/lib/rides';
 import { isDemoDriverKey } from '@/lib/drivers';
 import { api } from '../../../convex/_generated/api';
 import type { Id } from '../../../convex/_generated/dataModel';
 
-/** Widget « position partagée » : ouvre le tracé vers le point indiqué. */
+/**
+ * Widget « position partagée ».
+ *
+ * Il ouvre le tracé vers le point indiqué, et porte le cycle de vie de la course
+ * née de ce partage : le chauffeur y accepte ou refuse, les deux y suivent le
+ * statut ensuite.
+ */
 function LocationCard({
   mine,
   placeName,
   colors,
   styles,
+  rideStatus,
+  canRespond,
+  responding,
   onPress,
+  onRespond,
+  onTrack,
 }: {
   mine: boolean;
   placeName?: string;
   colors: VoraPalette;
   styles: ReturnType<typeof createStyles>;
+  rideStatus?: RideStatus;
+  /** Le chauffeur peut trancher : la course existe et attend encore. */
+  canRespond: boolean;
+  responding: boolean;
   onPress: () => void;
+  onRespond: (accept: boolean) => void;
+  onTrack: () => void;
 }) {
   const tint = mine ? colors.bubbleMineText : colors.accent;
 
@@ -66,6 +99,59 @@ function LocationCard({
             Voir l&apos;itineraire
           </Text>
         </View>
+
+        {rideStatus ? (
+          <View
+            style={[styles.ridePill, { backgroundColor: rideStatusTint(rideStatus, colors) }]}>
+            <Text style={[styles.ridePillLabel, { color: rideStatusColor(rideStatus, colors) }]}>
+              {rideStatusLabel(rideStatus, !mine)}
+            </Text>
+          </View>
+        ) : null}
+
+        {/* Voir le trajet avant de s'engager : distance jusqu'au client, et
+            jusqu'où il veut aller. */}
+        {canRespond ? (
+          <Pressable
+            accessibilityRole="button"
+            onPress={onTrack}
+            style={({ pressed }) => [styles.preview, pressed && styles.pressed]}>
+            <Route size={13} color={colors.text} />
+            <Text style={styles.previewLabel}>Voir le trajet</Text>
+          </Pressable>
+        ) : null}
+
+        {canRespond ? (
+          <View style={styles.rideActions}>
+            <Pressable
+              accessibilityRole="button"
+              disabled={responding}
+              onPress={() => onRespond(true)}
+              style={({ pressed }) => [styles.accept, pressed && styles.pressed]}>
+              <Check size={14} color={colors.onAccent} />
+              <Text style={styles.acceptLabel}>Accepter</Text>
+            </Pressable>
+            <Pressable
+              accessibilityRole="button"
+              disabled={responding}
+              onPress={() => onRespond(false)}
+              style={({ pressed }) => [styles.decline, pressed && styles.pressed]}>
+              <X size={14} color={colors.danger} />
+              <Text style={styles.declineLabel}>Refuser</Text>
+            </Pressable>
+          </View>
+        ) : null}
+
+        {rideStatus && rideStatus !== 'requested' ? (
+          <Pressable
+            accessibilityRole="button"
+            onPress={onTrack}
+            style={({ pressed }) => [styles.track, pressed && styles.pressed]}>
+            <Text style={[styles.trackLabel, mine && styles.locationLinkMine]}>
+              Suivre la course
+            </Text>
+          </Pressable>
+        ) : null}
       </View>
     </Pressable>
   );
@@ -84,12 +170,19 @@ export default function ChatScreen() {
     name,
     vehicle,
     conversationId: fromInbox,
+    destLat,
+    destLng,
+    destName,
   } = useLocalSearchParams<{
     driverKey: string;
     name?: string;
     vehicle?: string;
     /** Présent quand on arrive depuis la boîte de réception : le fil existe déjà. */
     conversationId?: string;
+    /** Destination en cours sur la carte, si le fil a été ouvert depuis celle-ci. */
+    destLat?: string;
+    destLng?: string;
+    destName?: string;
   }>();
 
   const driverName = name?.trim() || 'Chauffeur';
@@ -97,6 +190,8 @@ export default function ChatScreen() {
   const sendMessage = useMutation(api.chat.sendMessage);
   const markRead = useMutation(api.chat.markRead);
   const shareLocation = useMutation(api.chat.shareLocation);
+  const respondToRide = useMutation(api.rides.respond);
+  const [responding, setResponding] = useState(false);
   const geo = useGeo();
 
   const [conversationId, setConversationId] = useState<Id<'conversations'> | null>(
@@ -171,11 +266,18 @@ export default function ChatScreen() {
     setSharing(true);
     try {
       const place = await reverseGeocode([position.lng, position.lat]).catch(() => null);
+      const toLat = Number(destLat);
+      const toLng = Number(destLng);
+      const hasDestination = Number.isFinite(toLat) && Number.isFinite(toLng) && !!destLat && !!destLng;
+
       await shareLocation({
         conversationId,
         lat: position.lat,
         lng: position.lng,
         placeName: place?.place_name ?? place?.text,
+        destLat: hasDestination ? toLat : undefined,
+        destLng: hasDestination ? toLng : undefined,
+        destName: hasDestination ? destName || undefined : undefined,
       });
     } catch (err) {
       console.error('[chat] partage de position impossible', err);
@@ -183,7 +285,24 @@ export default function ChatScreen() {
     } finally {
       setSharing(false);
     }
-  }, [conversationId, geo.position, sharing, shareLocation]);
+  }, [conversationId, destLat, destLng, destName, geo.position, sharing, shareLocation]);
+
+  /** Réponse du chauffeur à une demande de course, depuis le message lui-même. */
+  const respond = useCallback(
+    async (rideId: Id<'rides'>, accept: boolean) => {
+      if (responding) return;
+      setResponding(true);
+      try {
+        await respondToRide({ rideId, accept });
+      } catch (err) {
+        console.error('[course] réponse impossible', err);
+        Alert.alert('Action impossible', (err as Error).message);
+      } finally {
+        setResponding(false);
+      }
+    },
+    [responding, respondToRide],
+  );
 
   const openPickup = useCallback(
     (lat: number, lng: number, label?: string) => {
@@ -314,6 +433,21 @@ export default function ChatScreen() {
                       placeName={message.placeName}
                       colors={colors}
                       styles={styles}
+                      rideStatus={message.rideStatus as RideStatus | undefined}
+                      canRespond={
+                        !message.mine &&
+                        details?.side === 'driver' &&
+                        message.rideStatus === 'requested' &&
+                        !!message.rideId
+                      }
+                      responding={responding}
+                      onRespond={(accept) => void respond(message.rideId!, accept)}
+                      onTrack={() =>
+                        router.push({
+                          pathname: '/ride/[rideId]',
+                          params: { rideId: message.rideId! },
+                        })
+                      }
                       onPress={() => openPickup(message.lat!, message.lng!, message.placeName)}
                     />
                   ) : (
@@ -579,6 +713,79 @@ const createStyles = (c: VoraPalette) =>
     },
     locationLinkMine: {
       color: c.bubbleMineText,
+    },
+    ridePill: {
+      alignSelf: 'flex-start',
+      borderRadius: 999,
+      paddingHorizontal: 8,
+      paddingVertical: 2,
+      marginTop: 4,
+    },
+    ridePillLabel: {
+      fontSize: 10,
+      fontWeight: '800',
+    },
+    rideActions: {
+      flexDirection: 'row',
+      gap: 6,
+      marginTop: 6,
+    },
+    accept: {
+      flex: 1,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 5,
+      height: 32,
+      borderRadius: 10,
+      backgroundColor: c.accent,
+    },
+    acceptLabel: {
+      color: c.onAccent,
+      fontSize: 12,
+      fontWeight: '800',
+    },
+    decline: {
+      flex: 1,
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 5,
+      height: 32,
+      borderRadius: 10,
+      borderWidth: 1,
+      borderColor: c.dangerBorder,
+      backgroundColor: c.dangerBg,
+    },
+    declineLabel: {
+      color: c.danger,
+      fontSize: 12,
+      fontWeight: '800',
+    },
+    preview: {
+      flexDirection: 'row',
+      alignItems: 'center',
+      justifyContent: 'center',
+      gap: 6,
+      height: 32,
+      borderRadius: 10,
+      borderWidth: 1,
+      borderColor: c.border,
+      backgroundColor: c.surfaceMuted,
+      marginTop: 6,
+    },
+    previewLabel: {
+      color: c.text,
+      fontSize: 12,
+      fontWeight: '700',
+    },
+    track: {
+      marginTop: 6,
+    },
+    trackLabel: {
+      color: c.accent,
+      fontSize: 12,
+      fontWeight: '800',
     },
     attach: {
       width: 44,

@@ -1,7 +1,7 @@
 import { v } from "convex/values";
 
 import { query } from "./_generated/server";
-import { currentUser } from "./users";
+import { currentUser } from "./model/auth";
 import type { Doc, Id } from "./_generated/dataModel";
 
 /** Ce que le passager reçoit pour chaque chauffeur suggéré. */

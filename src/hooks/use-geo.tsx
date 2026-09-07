@@ -1,4 +1,4 @@
-import { useMutation } from 'convex/react';
+import { useMutation, useQuery } from 'convex/react';
 import { createContext, useCallback, useContext, useEffect, useRef, type ReactNode } from 'react';
 import { AppState } from 'react-native';
 
@@ -7,6 +7,8 @@ import { api } from '../../convex/_generated/api';
 
 /** Rythme d'enregistrement de la position en base — 2 à 3 minutes. */
 const SYNC_INTERVAL_MS = 150_000;
+/** Pendant une course, le passager doit voir son chauffeur avancer. */
+const RIDE_SYNC_INTERVAL_MS = 15_000;
 
 const GeoContext = createContext<GeoState | null>(null);
 
@@ -36,7 +38,8 @@ export function useGeo(): GeoState {
 
 /**
  * Écrit la position dans `users` : tout de suite au premier point connu — donc
- * dès la création du compte — puis toutes les 2 min 30.
+ * dès la création du compte — puis toutes les 2 min 30, ou toutes les 15 s
+ * quand l'utilisateur conduit une course (le serveur en alimente le suivi).
  *
  * Le rythme vient d'un intervalle, pas des points GPS : à l'arrêt le capteur
  * n'émet plus rien et la position en base ne vieillirait jamais proprement.
@@ -44,8 +47,13 @@ export function useGeo(): GeoState {
  */
 function PositionSync({ geo }: { geo: GeoState }) {
   const updatePosition = useMutation(api.users.updatePosition);
+  const activeRide = useQuery(api.rides.activeForMe, {});
   const positionRef = useRef(geo.position);
   positionRef.current = geo.position;
+
+  // Seul le chauffeur d'une course active accélère : le passager n'a rien à suivre.
+  const driving = activeRide?.asDriver === true;
+  const interval = driving ? RIDE_SYNC_INTERVAL_MS : SYNC_INTERVAL_MS;
 
   const sentOnce = useRef(false);
 
@@ -73,10 +81,10 @@ function PositionSync({ geo }: { geo: GeoState }) {
     const timer = setInterval(() => {
       if (AppState.currentState !== 'active') return;
       push(false);
-    }, SYNC_INTERVAL_MS);
+    }, interval);
 
     return () => clearInterval(timer);
-  }, [push]);
+  }, [interval, push]);
 
   return null;
 }

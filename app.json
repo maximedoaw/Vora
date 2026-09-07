@@ -2,6 +2,7 @@
   "expo": {
     "name": "vora",
     "slug": "vora",
+    "owner": "maximedoaw",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/images/icon.png",
@@ -26,7 +27,8 @@
         "backgroundImage": "./assets/images/android-icon-background.png",
         "monochromeImage": "./assets/images/android-icon-monochrome.png"
       },
-      "predictiveBackGestureEnabled": false
+      "predictiveBackGestureEnabled": false,
+      "googleServicesFile": "./google-services.json"
     },
     "web": {
       "output": "static",
@@ -49,11 +51,23 @@
         {
           "locationWhenInUsePermission": "Vora a besoin de ta position pour te placer sur la carte et calculer un itinéraire."
         }
+      ],
+      [
+        "expo-notifications",
+        {
+          "color": "#1ED760",
+          "defaultChannel": "default"
+        }
       ]
     ],
     "experiments": {
       "typedRoutes": true,
       "reactCompiler": true
+    },
+    "extra": {
+      "eas": {
+        "projectId": "b28b3793-a820-4aba-923d-e448805eda2b"
+      }
     }
   }
 }

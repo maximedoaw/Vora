@@ -11,7 +11,15 @@ import {
   TextLink,
 } from '@/components/auth/auth-form-kit';
 import { AuthShell } from '@/components/auth/auth-shell';
+import { notifyLocally } from '@/lib/notifications';
 import { convexErrorMessage } from '@/lib/errors';
+import {
+  OPERATOR_LABEL,
+  PHONE_DIGITS,
+  PHONE_PREFIX,
+  phoneError,
+  phoneOperator,
+} from '@/lib/phone';
 import { api } from '../../convex/_generated/api';
 
 /** Doit rester aligné sur `MIN_NAME_LENGTH` / `MAX_NAME_LENGTH` (convex/users.ts). */
@@ -54,10 +62,23 @@ export function OnboardingScreen({ initialName = '' }: { initialName?: string })
   const [step, setStep] = useState<Step>('role');
   const [role, setRole] = useState<Role | null>(null);
   const [name, setName] = useState(initialName);
+  const [phone, setPhone] = useState('');
   const [vehicleType, setVehicleType] = useState('');
   const [plate, setPlate] = useState('');
   const [pending, setPending] = useState(false);
   const [error, setError] = useState<string | null>(null);
+
+  /** Retour immédiat sur l'opérateur reconnu — ou sur ce qui cloche. */
+  const phoneHint = (() => {
+    const operator = phoneOperator(phone);
+    if (operator) return `Numéro ${OPERATOR_LABEL[operator]} reconnu.`;
+    if (phone.replace(/\D/g, '').length === PHONE_DIGITS) {
+      return 'Ni Orange ni MTN : ce numéro ne peut ni payer ni être payé.';
+    }
+    return role === 'driver'
+      ? 'Les passagers y transféreront le montant de leurs courses.'
+      : 'Sert à te joindre et à régler tes courses.';
+  })();
 
   const nameTaken = useQuery(
     api.users.isNameTaken,
@@ -84,12 +105,17 @@ export function OnboardingScreen({ initialName = '' }: { initialName?: string })
       return `Le nom doit faire entre ${MIN_NAME_LENGTH} et ${MAX_NAME_LENGTH} caractères.`;
     }
     if (nameTaken) return "Ce nom d'utilisateur est déjà pris.";
+
+    // Mêmes règles que `convex/model/phone.ts`, pour un retour immédiat.
+    const phoneProblem = phoneError(phone);
+    if (phoneProblem) return phoneProblem;
+
     if (role === 'driver') {
       if (!vehicleType.trim()) return 'Indique le type de ton véhicule.';
       if (plate.trim().length < MIN_PLATE_LENGTH) return "Plaque d'immatriculation invalide.";
     }
     return null;
-  }, [name, nameTaken, plate, role, vehicleType]);
+  }, [name, nameTaken, phone, plate, role, vehicleType]);
 
   const submit = useCallback(async () => {
     if (pending || !role) return;
@@ -107,12 +133,17 @@ export function OnboardingScreen({ initialName = '' }: { initialName?: string })
       await completeOnboarding({
         role,
         name: name.trim(),
+        phone: phone.trim(),
         vehicle:
           role === 'driver'
             ? { type: vehicleType.trim(), plate: plate.trim().toUpperCase() }
             : undefined,
       });
       // Succès : `getMe` se met à jour tout seul et `_layout` affiche l'app.
+      void notifyLocally(
+        'Bienvenue sur Vora',
+        `Ton compte ${role === 'driver' ? 'chauffeur' : 'passager'} est prêt.`,
+      );
     } catch (mutationError) {
       setError(
         convexErrorMessage(
@@ -123,7 +154,7 @@ export function OnboardingScreen({ initialName = '' }: { initialName?: string })
     } finally {
       setPending(false);
     }
-  }, [completeOnboarding, name, pending, plate, role, validateProfile, vehicleType]);
+  }, [completeOnboarding, name, pending, phone, plate, role, validateProfile, vehicleType]);
 
   if (step === 'role') {
     return (
@@ -195,6 +226,19 @@ export function OnboardingScreen({ initialName = '' }: { initialName?: string })
             ? "Ce nom d'utilisateur est déjà pris"
             : `Entre ${MIN_NAME_LENGTH} et ${MAX_NAME_LENGTH} caractères`
         }
+      />
+
+      <AuthField
+        label="Numéro de téléphone"
+        prefix={PHONE_PREFIX}
+        value={phone}
+        onChangeText={(text) => setPhone(text.replace(/\D/g, '').slice(0, PHONE_DIGITS))}
+        placeholder="6 XX XX XX XX"
+        keyboardType="phone-pad"
+        autoCorrect={false}
+        editable={!pending}
+        returnKeyType={role === 'driver' ? 'next' : 'done'}
+        hint={phoneHint}
       />
 
       {role === 'driver' ? (
