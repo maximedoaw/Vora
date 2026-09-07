@@ -93,10 +93,65 @@ export default defineSchema({
     paidToPhone: v.optional(v.string()),
     /** Horodate l'unique alerte « chauffeur à moins de 200 m ». */
     nearNotifiedAt: v.optional(v.number()),
+    /**
+     * Instant où chauffeur et passager se sont trouvés à moins de quelques
+     * mètres l'un de l'autre : à partir de là ils roulent ensemble, et les deux
+     * téléphones alimentent indifféremment la position suivie de la course.
+     */
+    joinedAt: v.optional(v.number()),
+    /**
+     * Trajet partagé : le passager accepte que d'autres montent sur son
+     * itinéraire. Absent = course privée, comportement historique.
+     */
+    shared: v.optional(v.boolean()),
+    /** Activation du partage — la recherche de passagers part de cet instant. */
+    sharedAt: v.optional(v.number()),
+    /**
+     * Places assises du véhicule, transmises par l'app à l'activation : la
+     * grille des types de véhicule vit côté client, le serveur n'en garde que
+     * le nombre dont il a besoin pour refuser un passager de trop.
+     */
+    seats: v.optional(v.number()),
   })
     .index("by_rider", ["riderId"])
     .index("by_driver", ["driverId"])
     .index("by_status", ["status"]),
+
+  /**
+   * Passagers qui partagent la course d'un autre.
+   *
+   * Chacun est situé par sa **progression** le long de l'itinéraire du passager
+   * principal : `0` = point de prise en charge, `1` = destination. Deux nombres
+   * suffisent à découper le trajet en segments et à répartir le tarif, sans
+   * stocker ni recalculer de polyligne côté serveur.
+   *
+   * Conséquence assumée : un compagnon ne peut pas aller **au-delà** de la
+   * destination du passager principal — c'est elle qui porte l'itinéraire
+   * calculé et donc le tarif.
+   */
+  rideCompanions: defineTable({
+    rideId: v.id("rides"),
+    /** Passager inscrit ; absent pour un profil de test. */
+    userId: v.optional(v.id("users")),
+    name: v.string(),
+    /** `true` = profil simulé, affiché comme tel dans l'application. */
+    demo: v.boolean(),
+    /** Progression de la montée puis de la descente, entre 0 et 1. */
+    boardProgress: v.number(),
+    dropProgress: v.number(),
+    /** Position interpolée sur l'itinéraire, pour l'affichage. */
+    boardPoint: v.object({ lat: v.number(), lng: v.number() }),
+    dropPoint: v.object({ lat: v.number(), lng: v.number() }),
+    status: v.union(
+      v.literal("waiting"),
+      v.literal("onboard"),
+      v.literal("dropped"),
+      v.literal("cancelled"),
+    ),
+    joinedAt: v.number(),
+    boardedAt: v.optional(v.number()),
+    droppedAt: v.optional(v.number()),
+  }).index("by_ride", ["rideId"]),
 
   /**
    * Jetons de notification Expo, un par appareil.
@@ -114,13 +169,19 @@ export default defineSchema({
     .index("by_user", ["userId"])
     .index("by_token", ["token"]),
 
-  /** Une ligne par course : la position du chauffeur y est écrasée en place. */
+  /** Une ligne par course : la position du véhicule y est écrasée en place. */
   driverPositions: defineTable({
     rideId: v.id("rides"),
     lat: v.number(),
     lng: v.number(),
     heading: v.optional(v.number()),
     updatedAt: v.optional(v.number()),
+    /**
+     * Téléphone d'où vient ce point. Avant la jonction c'est toujours celui du
+     * chauffeur ; une fois à bord, celui des deux qui émet en premier — ils
+     * sont au même endroit, et l'un peut avoir l'application en arrière-plan.
+     */
+    source: v.optional(v.union(v.literal("driver"), v.literal("rider"))),
   }).index("by_ride", ["rideId"]),
 
   vehicles: defineTable({

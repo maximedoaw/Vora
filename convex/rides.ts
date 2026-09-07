@@ -19,6 +19,22 @@ export type RidePayment = {
 
 /** Rayon de l'alerte « ton chauffeur arrive » — envoyée une seule fois. */
 const NEAR_RADIUS_M = 200;
+
+/**
+ * Rayon de la **jonction** : en deçà, le chauffeur et son passager sont au même
+ * endroit — donc ensemble dans le véhicule. La course démarre alors d'elle-même
+ * et les deux téléphones se mettent à alimenter la même position suivie.
+ *
+ * Cinq mètres est plus fin que ce qu'un GPS de téléphone sait garantir (5 à
+ * 20 m d'incertitude en ville). La jonction automatique est donc un
+ * accélérateur, pas l'unique chemin : le bouton « Démarrer la course » reste en
+ * place et produit exactement le même résultat.
+ */
+export const JOIN_RADIUS_M = 5;
+
+/** Au-delà, la position enregistrée d'un compte est trop vieille pour servir. */
+const FRESH_POSITION_MS = 3 * 60 * 1000;
+
 const R_EARTH_KM = 6371;
 
 function haversineKm(a: [number, number], b: [number, number]): number {
@@ -53,6 +69,8 @@ export type RideSummary = {
   conversationId: Id<"conversations"> | null;
   requestedAt: number;
   acceptedAt: number | null;
+  /** Instant de la jonction à moins de 5 m, `null` si elle n'a pas eu lieu. */
+  joinedAt: number | null;
   startedAt: number | null;
   endedAt: number | null;
   cancelledBy: "rider" | "driver" | null;
@@ -137,6 +155,7 @@ async function summarize(
     conversationId: ride.conversationId ?? null,
     requestedAt: ride._creationTime,
     acceptedAt: ride.acceptedAt ?? null,
+    joinedAt: ride.joinedAt ?? null,
     startedAt: ride.startedAt ?? null,
     endedAt: ride.endedAt ?? null,
     cancelledBy: ride.cancelledBy ?? null,
@@ -152,61 +171,183 @@ async function positionRow(ctx: QueryCtx, rideId: Id<"rides">) {
 }
 
 /**
- * Courses en cours du chauffeur — utilisé par `users.updatePosition` pour
- * alimenter le suivi sans que le chauffeur ait à rester sur un écran précis.
+ * Courses actives de l'utilisateur, qu'il les conduise ou qu'il y soit passager.
+ *
+ * Les deux rôles sont retenus parce que le suivi ne s'arrête plus au chauffeur :
+ * une fois la jonction faite, le téléphone du passager avance au même rythme et
+ * peut tout aussi bien rapporter la position du véhicule.
  */
-export async function activeRidesOfDriver(ctx: QueryCtx, driverId: Id<"users">) {
-  const rides = await ctx.db
-    .query("rides")
-    .withIndex("by_driver", (q) => q.eq("driverId", driverId))
-    .collect();
-  return rides.filter((ride) => isActive(ride.status));
+export async function activeRidesOf(ctx: QueryCtx, userId: Id<"users">) {
+  const [asDriver, asRider] = await Promise.all([
+    ctx.db
+      .query("rides")
+      .withIndex("by_driver", (q) => q.eq("driverId", userId))
+      .collect(),
+    ctx.db
+      .query("rides")
+      .withIndex("by_rider", (q) => q.eq("riderId", userId))
+      .collect(),
+  ]);
+
+  const seen = new Set<string>();
+  return [...asDriver, ...asRider].filter((ride) => {
+    if (!isActive(ride.status) || seen.has(ride._id)) return false;
+    seen.add(ride._id);
+    return true;
+  });
 }
 
-/** Écrit la position du chauffeur pour chacune de ses courses actives. */
-export async function trackDriver(
+/** Écrit — ou écrase — la position suivie d'une course. */
+async function writePosition(
   ctx: MutationCtx,
-  driverId: Id<"users">,
+  rideId: Id<"rides">,
+  lat: number,
+  lng: number,
+  heading: number | undefined,
+  source: "driver" | "rider",
+) {
+  const existing = await positionRow(ctx, rideId);
+  const updatedAt = Date.now();
+
+  if (existing) {
+    await ctx.db.patch(existing._id, { lat, lng, heading, updatedAt, source });
+    return;
+  }
+  await ctx.db.insert("driverPositions", { rideId, lat, lng, heading, updatedAt, source });
+}
+
+/**
+ * Position du passager pour tester la jonction.
+ *
+ * Sa position vivante si elle est fraîche, sinon le point de prise en charge :
+ * c'est là qu'il a dit attendre, et c'est mieux que de ne rien pouvoir conclure
+ * quand son téléphone n'émet pas.
+ */
+function riderPointOf(ride: Doc<"rides">, rider: Doc<"users"> | null, now: number): [number, number] {
+  const fresh =
+    rider?.lastLng != null &&
+    rider.lastLat != null &&
+    now - (rider.lastPositionAt ?? 0) < FRESH_POSITION_MS;
+
+  return fresh
+    ? [rider.lastLng as number, rider.lastLat as number]
+    : [ride.pickup.lng, ride.pickup.lat];
+}
+
+/**
+ * Jonction du chauffeur et de son passager.
+ *
+ * Elle fait basculer la course en `in_progress` : à partir de là ils avancent
+ * ensemble vers la destination, et plus rien ne les sépare jusqu'à ce que l'un
+ * des deux annule ou déclare la course terminée.
+ *
+ * Le drapeau est posé dans la même transaction que le test — Convex sérialise
+ * les mutations, deux positions arrivées coup sur coup ne peuvent pas franchir
+ * le seuil toutes les deux.
+ */
+async function joinIfTogether(
+  ctx: MutationCtx,
+  ride: Doc<"rides">,
+  driverPoint: [number, number],
+  riderPoint: [number, number],
+) {
+  if (ride.status !== "matched" || ride.joinedAt) return false;
+  if (haversineKm(driverPoint, riderPoint) * 1000 > JOIN_RADIUS_M) return false;
+
+  const now = Date.now();
+  await ctx.db.patch(ride._id, {
+    status: "in_progress",
+    joinedAt: now,
+    startedAt: ride.startedAt ?? now,
+  });
+
+  const url = `/ride/${ride._id}`;
+  await ctx.scheduler.runAfter(0, internal.push.send, {
+    userId: ride.riderId,
+    title: "En route",
+    body: "Tu es à bord : la course a démarré vers ta destination.",
+    url,
+  });
+
+  if (ride.driverId) {
+    await ctx.scheduler.runAfter(0, internal.push.send, {
+      userId: ride.driverId,
+      title: "En route",
+      body: "Ton passager est à bord : la course a démarré.",
+      url,
+    });
+  }
+
+  return true;
+}
+
+/**
+ * Alimente le suivi de toutes les courses actives de cet utilisateur, et
+ * indique s'il y en avait au moins une — ce qui commande le rythme
+ * d'enregistrement de sa position dans `users`.
+ *
+ * Avant la jonction, seul le chauffeur écrit : la position du passager est
+ * celle du point de rendez-vous, pas celle du véhicule. Après, les deux
+ * écrivent — ils sont au même endroit et l'un des deux peut avoir mis
+ * l'application en arrière-plan.
+ */
+export async function trackRide(
+  ctx: MutationCtx,
+  userId: Id<"users">,
   lat: number,
   lng: number,
   heading?: number,
-) {
-  const rides = await activeRidesOfDriver(ctx, driverId);
-  const now = Date.now();
+): Promise<boolean> {
+  const rides = await activeRidesOf(ctx, userId);
+  if (rides.length === 0) return false;
 
-  const driver = await ctx.db.get(driverId);
+  const now = Date.now();
+  const point: [number, number] = [lng, lat];
 
   for (const ride of rides) {
-    const existing = await positionRow(ctx, ride._id);
-    if (existing) {
-      await ctx.db.patch(existing._id, { lat, lng, heading, updatedAt: now });
-    } else {
-      await ctx.db.insert("driverPositions", { rideId: ride._id, lat, lng, heading, updatedAt: now });
+    const asDriver = ride.driverId === userId;
+
+    if (asDriver) {
+      await writePosition(ctx, ride._id, lat, lng, heading, "driver");
+
+      const rider = await ctx.db.get(ride.riderId);
+
+      /**
+       * « Ton chauffeur arrive » — une seule fois par course, et seulement en
+       * `matched` : en `in_progress` le passager est déjà à bord.
+       */
+      if (
+        ride.status === "matched" &&
+        !ride.nearNotifiedAt &&
+        haversineKm(point, [ride.pickup.lng, ride.pickup.lat]) * 1000 < NEAR_RADIUS_M
+      ) {
+        await ctx.db.patch(ride._id, { nearNotifiedAt: now });
+        const driver = await ctx.db.get(userId);
+        await ctx.scheduler.runAfter(0, internal.push.send, {
+          userId: ride.riderId,
+          title: "Ton chauffeur arrive",
+          body: `${driver?.name ?? "Ton chauffeur"} est à moins de ${NEAR_RADIUS_M} m.`,
+          url: `/ride/${ride._id}`,
+        });
+      }
+
+      await joinIfTogether(ctx, ride, point, riderPointOf(ride, rider, now));
+      continue;
     }
 
-    /**
-     * « Ton chauffeur arrive » — une seule fois par course.
-     *
-     * Le drapeau est posé dans la **même transaction** que la lecture : Convex
-     * sérialise les mutations, donc deux positions arrivées coup sur coup ne
-     * peuvent pas franchir le test toutes les deux.
-     *
-     * Restreint à `matched` : en `in_progress` le passager est déjà à bord.
-     */
-    if (
-      ride.status === "matched" &&
-      !ride.nearNotifiedAt &&
-      haversineKm([lng, lat], [ride.pickup.lng, ride.pickup.lat]) * 1000 < NEAR_RADIUS_M
-    ) {
-      await ctx.db.patch(ride._id, { nearNotifiedAt: now });
-      await ctx.scheduler.runAfter(0, internal.push.send, {
-        userId: ride.riderId,
-        title: "Ton chauffeur arrive",
-        body: `${driver?.name ?? "Ton chauffeur"} est à moins de ${NEAR_RADIUS_M} m.`,
-        url: `/ride/${ride._id}`,
-      });
+    // Passager. Une fois à bord, son téléphone vaut celui du chauffeur.
+    if (ride.joinedAt) {
+      await writePosition(ctx, ride._id, lat, lng, heading, "rider");
+      continue;
+    }
+
+    const tracked = await positionRow(ctx, ride._id);
+    if (tracked) {
+      await joinIfTogether(ctx, ride, [tracked.lng, tracked.lat], point);
     }
   }
+
+  return true;
 }
 
 /**
@@ -240,7 +381,7 @@ export const respond = mutation({
 
     // Première position connue du chauffeur, pour que le passager le voie tout de suite.
     if (me.lastLat != null && me.lastLng != null) {
-      await trackDriver(ctx, me._id, me.lastLat, me.lastLng);
+      await trackRide(ctx, me._id, me.lastLat, me.lastLng);
     }
 
     await ctx.scheduler.runAfter(0, internal.push.send, {
@@ -561,7 +702,7 @@ export const activeForMe = query({
  * compare l'état d'un rendu à l'autre — un changement de statut déclenche une
  * bannière. Contrepartie : ça ne fonctionne que si l'application tourne.
  *
- * `nearNotifiedAt` est posé une seule fois par `trackDriver` : le client s'en
+ * `nearNotifiedAt` est posé une seule fois par `trackRide` : le client s'en
  * sert comme signal, sans avoir à refaire le calcul de distance.
  */
 export const alertState = query({

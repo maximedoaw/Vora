@@ -2,7 +2,7 @@ import { v } from "convex/values";
 import { internalMutation, mutation, query, type QueryCtx } from "./_generated/server";
 import { currentUser, userByClerkId } from "./model/auth";
 import { normalizePhone, phoneError } from "./model/phone";
-import { trackDriver } from "./rides";
+import { trackRide } from "./rides";
 
 export const MIN_NAME_LENGTH = 2;
 export const MAX_NAME_LENGTH = 40;
@@ -161,6 +161,15 @@ export const completeOnboarding = mutation({
 /** Intervalle minimal entre deux écritures de position (2 minutes). */
 export const POSITION_MIN_INTERVAL_MS = 120_000;
 
+/**
+ * Rythme resserré pendant une course, chauffeur comme passager.
+ *
+ * La jonction à 5 m se teste contre la dernière position connue du passager :
+ * la laisser vieillir deux minutes reviendrait à comparer le véhicule à un
+ * point où le passager n'est plus.
+ */
+export const RIDE_POSITION_MIN_INTERVAL_MS = 20_000;
+
 function isCoordinate(lat: number, lng: number) {
   return (
     Number.isFinite(lat) && Number.isFinite(lng) && Math.abs(lat) <= 90 && Math.abs(lng) <= 180
@@ -188,13 +197,17 @@ export const updatePosition = mutation({
 
     const now = Date.now();
     const last = user.lastPositionAt ?? 0;
-    const tooSoon = !immediate && now - last < POSITION_MIN_INTERVAL_MS;
 
-    // Une course en cours prime sur le rythme d'économie : le passager doit
-    // voir son chauffeur avancer, pas sauter toutes les deux minutes.
-    if (user.role === "driver") await trackDriver(ctx, user._id, lat, lng);
+    /*
+     * Le suivi de course passe avant le garde-fou : il n'est jamais throttlé,
+     * et les deux parties l'alimentent — le chauffeur pendant son approche, les
+     * deux une fois à bord. Le rôle ne suffit donc plus à décider qui écrit,
+     * c'est la course qui tranche.
+     */
+    const onRide = await trackRide(ctx, user._id, lat, lng);
 
-    if (tooSoon) return user.lastPositionAt ?? null;
+    const minInterval = onRide ? RIDE_POSITION_MIN_INTERVAL_MS : POSITION_MIN_INTERVAL_MS;
+    if (!immediate && now - last < minInterval) return user.lastPositionAt ?? null;
 
     await ctx.db.patch(user._id, { lastLat: lat, lastLng: lng, lastPositionAt: now });
     return now;

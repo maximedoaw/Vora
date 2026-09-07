@@ -7,8 +7,34 @@ import { api } from '../../convex/_generated/api';
 
 /** Rythme d'enregistrement de la position en base — 2 à 3 minutes. */
 const SYNC_INTERVAL_MS = 150_000;
-/** Pendant une course, le passager doit voir son chauffeur avancer. */
-const RIDE_SYNC_INTERVAL_MS = 15_000;
+
+/** Approche : le passager doit voir son chauffeur avancer vers lui. */
+const APPROACH_SYNC_INTERVAL_MS = 15_000;
+
+/**
+ * Le passager pendant l'approche. Il n'a rien à faire voir, mais sa position
+ * sert à détecter la jonction à 5 m : la laisser vieillir la rendrait
+ * impossible.
+ */
+const RIDER_APPROACH_SYNC_INTERVAL_MS = 30_000;
+
+/**
+ * Une fois à bord, chauffeur et passager avancent ensemble vers la destination
+ * et les deux téléphones alimentent la même position suivie : une minute
+ * suffit, et ménage deux batteries au lieu d'une.
+ */
+const ONBOARD_SYNC_INTERVAL_MS = 60_000;
+
+type ActiveRide = { asDriver: boolean; status: string } | null | undefined;
+
+/** Rythme d'envoi selon l'étape de la course en cours. */
+function syncInterval(ride: ActiveRide): number {
+  if (!ride) return SYNC_INTERVAL_MS;
+  if (ride.status === 'in_progress') return ONBOARD_SYNC_INTERVAL_MS;
+  // Une course encore `requested` n'engage personne : rien à suivre.
+  if (ride.status !== 'matched') return SYNC_INTERVAL_MS;
+  return ride.asDriver ? APPROACH_SYNC_INTERVAL_MS : RIDER_APPROACH_SYNC_INTERVAL_MS;
+}
 
 const GeoContext = createContext<GeoState | null>(null);
 
@@ -38,8 +64,8 @@ export function useGeo(): GeoState {
 
 /**
  * Écrit la position dans `users` : tout de suite au premier point connu — donc
- * dès la création du compte — puis toutes les 2 min 30, ou toutes les 15 s
- * quand l'utilisateur conduit une course (le serveur en alimente le suivi).
+ * dès la création du compte — puis à un rythme qui dépend de la course en
+ * cours, de 2 min 30 au repos à 15 s pendant l'approche d'un chauffeur.
  *
  * Le rythme vient d'un intervalle, pas des points GPS : à l'arrêt le capteur
  * n'émet plus rien et la position en base ne vieillirait jamais proprement.
@@ -51,9 +77,9 @@ function PositionSync({ geo }: { geo: GeoState }) {
   const positionRef = useRef(geo.position);
   positionRef.current = geo.position;
 
-  // Seul le chauffeur d'une course active accélère : le passager n'a rien à suivre.
-  const driving = activeRide?.asDriver === true;
-  const interval = driving ? RIDE_SYNC_INTERVAL_MS : SYNC_INTERVAL_MS;
+  // Les deux parties accélèrent désormais : avant la jonction pour qu'elle soit
+  // détectable, après pour que le trajet avance sur les deux écrans à la fois.
+  const interval = syncInterval(activeRide);
 
   const sentOnce = useRef(false);
 

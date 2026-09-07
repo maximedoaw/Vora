@@ -14,6 +14,21 @@ export type MapDriver = {
   available: boolean;
 };
 
+/** Vue à plat, ou caméra inclinée avec bâtiments extrudés. */
+export type MapViewMode = '2d' | '3d';
+
+/**
+ * État de la simulation de trajet. `paused` conserve l'avancement : reprendre
+ * repart de là où le véhicule s'est arrêté, jamais du début.
+ */
+export type MapSimState = 'idle' | 'running' | 'paused';
+
+/** Inclinaison de la caméra en 3D — partagée par la WebView et la carte web. */
+export const PITCH_3D = 58;
+
+/** Zoom du suivi orienté : assez près pour lire la rue qui arrive. */
+export const FOLLOW_ZOOM = 17;
+
 export type MapCameraHandle = {
   flyTo: (lng: number, lat: number, zoom?: number) => void;
   fitRoute: (coords: [number, number][]) => void;

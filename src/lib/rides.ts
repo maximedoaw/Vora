@@ -24,6 +24,16 @@ export function isRideActive(status: RideStatus): boolean {
   return status === 'requested' || status === 'matched' || status === 'in_progress';
 }
 
+/**
+ * Miroir de `JOIN_RADIUS_M` dans `convex/rides.ts` : distance en deçà de
+ * laquelle chauffeur et passager sont considérés ensemble, et la course démarre
+ * d'elle-même.
+ *
+ * Repris ici pour l'affichage seulement — le seuil qui fait foi est celui du
+ * serveur, et les deux valeurs doivent évoluer ensemble.
+ */
+export const JOIN_RADIUS_M = 5;
+
 /** Couleur de la pastille de statut, prise dans la palette du thème courant. */
 export function rideStatusColor(status: RideStatus, c: VoraPalette): string {
   switch (status) {

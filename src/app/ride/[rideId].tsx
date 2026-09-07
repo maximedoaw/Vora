@@ -2,7 +2,9 @@ import { useMutation, useQuery } from 'convex/react';
 import { router, useLocalSearchParams } from 'expo-router';
 import {
   CarFront,
+  ChevronDown,
   ChevronLeft,
+  ChevronUp,
   Clock,
   Flag,
   MapPin,
@@ -12,10 +14,12 @@ import {
 } from 'lucide-react-native';
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ActivityIndicator, Alert, Pressable, StyleSheet, Text, View } from 'react-native';
+import Animated, { LinearTransition } from 'react-native-reanimated';
 import { useSafeAreaInsets } from 'react-native-safe-area-context';
 
 import { NativeMap } from '@/components/map/native-map';
 import { RidePayment, type PaymentMethod } from '@/components/ride-payment';
+import { SharedRide, type SharingState } from '@/components/shared-ride';
 import { StarRating } from '@/components/star-rating';
 import { useGeo } from '@/hooks/use-geo';
 import type { MapCameraHandle, MapDriver } from '@/components/map/native-map-shared';
@@ -26,11 +30,61 @@ import { useSettledOrigin } from '@/hooks/use-settled-origin';
 import { formatDistance, formatDuration } from '@/lib/geo-utils';
 import type { GeocodeFeature } from '@/lib/geocoding';
 import { FIRST_FIX_ZOOM } from '@/lib/map';
-import { isRideActive, rideStatusColor, rideStatusLabel, rideStatusTint } from '@/lib/rides';
-import type { LngLat } from '@/lib/routing';
+import {
+  isRideActive,
+  JOIN_RADIUS_M,
+  rideStatusColor,
+  rideStatusLabel,
+  rideStatusTint,
+} from '@/lib/rides';
+import type { LngLat, RouteResult } from '@/lib/routing';
+import {
+  MAIN_RIDER_ID,
+  SHARE_SEARCH_DELAY_MS,
+  shareOf,
+  splitSharedFare,
+  type FareSplit,
+  type SharedLeg,
+} from '@/lib/shared-ride';
 import { estimateFare, formatXaf, resolveVehicleType } from '@/lib/vehicles';
 import { api } from '../../../convex/_generated/api';
 import type { Id } from '../../../convex/_generated/dataModel';
+
+/**
+ * Répartition du tarif entre le passager principal et ceux qui partagent son
+ * trajet.
+ *
+ * Adossée au même itinéraire que le tarif plein, donc calculée seulement quand
+ * on regarde la course : sur l'approche du chauffeur il n'y a pas de trajet
+ * client à découper. Un passager déjà déposé reste dans le calcul — il a occupé
+ * sa portion, l'en retirer ferait remonter la part des autres après coup.
+ */
+function sharedSplits(
+  sharing: SharingState | null | undefined,
+  route: RouteResult | null,
+  vehicleLabel: string | undefined,
+): FareSplit[] {
+  if (!sharing?.enabled || !route || !vehicleLabel) return [];
+
+  const legs: SharedLeg[] = [
+    { id: MAIN_RIDER_ID, name: 'Toi', from: 0, to: 1 },
+    ...sharing.companions
+      .filter((companion) => companion.status !== 'cancelled')
+      .map((companion) => ({
+        id: companion.id,
+        name: companion.name,
+        from: companion.boardProgress,
+        to: companion.dropProgress,
+      })),
+  ];
+
+  return splitSharedFare(
+    resolveVehicleType(vehicleLabel),
+    route.distanceM / 1000,
+    route.durationS / 60,
+    legs,
+  );
+}
 
 /**
  * Suivi d'une course en direct.
@@ -54,8 +108,21 @@ export default function RideScreen() {
   const rate = useMutation(api.rides.rate);
   const respond = useMutation(api.rides.respond);
   const pay = useMutation(api.rides.pay);
+
+  const sharing = useQuery(api.sharing.stateOf, { rideId: rideId as Id<'rides'> });
+  const setShared = useMutation(api.sharing.setShared);
+  const boardCompanion = useMutation(api.sharing.board);
+  const dropCompanion = useMutation(api.sharing.drop);
+
   const [busy, setBusy] = useState(false);
   const [draftRating, setDraftRating] = useState(0);
+
+  /**
+   * La fiche de suivi occupe le bas de l'écran et masque une bonne part du
+   * trajet : elle se replie sur son en-tête, qui garde l'essentiel — distance,
+   * durée et montant.
+   */
+  const [expanded, setExpanded] = useState(true);
 
   /** Quelle distance on suit : jusqu'au passager, ou jusqu'à la destination. */
   const [focus, setFocus] = useState<'pickup' | 'destination'>('pickup');
@@ -103,6 +170,16 @@ export default function RideScreen() {
     const type = resolveVehicleType(ride.vehicle.type);
     return estimateFare(type, route.distanceM / 1000, route.durationS / 60);
   }, [onCourse, ride?.vehicle, route]);
+
+  // Simple arithmétique sur une poignée de portions : mémoriser coûterait plus
+  // cher que recalculer, et la fonction vit hors du composant pour le dire.
+  const splits = sharedSplits(sharing, onCourse ? route : null, ride?.vehicle?.type);
+
+  /** Ce que le passager règle : sa part s'il partage, le plein tarif sinon. */
+  const payable = shareOf(splits, MAIN_RIDER_ID)?.amount ?? fare;
+
+  /** Places du véhicule, transmises au serveur à l'activation du partage. */
+  const seats = ride?.vehicle ? resolveVehicleType(ride.vehicle.type).seats : undefined;
 
   /** Le marqueur suit le point dont on mesure la distance. */
   const marker = useMemo<GeocodeFeature | null>(() => {
@@ -195,6 +272,40 @@ export default function RideScreen() {
     ]);
   }, [cancel, rideId, run]);
 
+  const toggleSharing = useCallback(
+    (enabled: boolean) =>
+      void run(
+        () =>
+          setShared({
+            rideId: rideId as Id<'rides'>,
+            enabled,
+            // Le serveur ne tient pas la grille des véhicules : on lui transmet
+            // le nombre de places de celui qui fait la course.
+            seats,
+          }),
+        'partage impossible',
+      ),
+    [rideId, run, seats, setShared],
+  );
+
+  const markBoarded = useCallback(
+    (companionId: string) =>
+      void run(
+        () => boardCompanion({ companionId: companionId as Id<'rideCompanions'> }),
+        'montée impossible',
+      ),
+    [boardCompanion, run],
+  );
+
+  const markDropped = useCallback(
+    (companionId: string) =>
+      void run(
+        () => dropCompanion({ companionId: companionId as Id<'rideCompanions'> }),
+        'descente impossible',
+      ),
+    [dropCompanion, run],
+  );
+
   if (ride === undefined) {
     return (
       <View style={[styles.root, styles.centered]}>
@@ -259,8 +370,15 @@ export default function RideScreen() {
           </View>
         </View>
 
-        <View style={styles.card}>
-          <View style={styles.place}>
+        <Animated.View layout={LinearTransition.duration(220)} style={styles.card}>
+          {/* En-tête toujours visible : c'est lui qui plie et déplie la fiche,
+              pour rendre la carte au regard sans quitter la course. */}
+          <Pressable
+            accessibilityRole="button"
+            accessibilityState={{ expanded }}
+            accessibilityLabel={expanded ? 'Réduire les détails' : 'Afficher les détails'}
+            onPress={() => setExpanded((open) => !open)}
+            style={({ pressed }) => [styles.place, pressed && styles.pressed]}>
             <View style={styles.placeIcon}>
               <MapPin size={18} color={colors.accent} />
             </View>
@@ -271,303 +389,350 @@ export default function RideScreen() {
                   : (ride.pickupName ?? 'Point de prise en charge')}
               </Text>
               <Text style={styles.coords}>
-                {onCourse && ride.destination
-                  ? `${ride.destination.lat.toFixed(5)}, ${ride.destination.lng.toFixed(5)}`
-                  : `${ride.pickup.lat.toFixed(5)}, ${ride.pickup.lng.toFixed(5)}`}
+                {/* Replié, la fiche doit encore dire l'essentiel : ce qu'il
+                    reste à parcourir et ce que ça coûte. */}
+                {!expanded && route
+                  ? `${formatDistance(route.distanceM / 1000)} · ${formatDuration(route.durationS)}${
+                      payable != null ? ` · ${formatXaf(payable)}` : ''
+                    }`
+                  : onCourse && ride.destination
+                    ? `${ride.destination.lat.toFixed(5)}, ${ride.destination.lng.toFixed(5)}`
+                    : `${ride.pickup.lat.toFixed(5)}, ${ride.pickup.lng.toFixed(5)}`}
               </Text>
             </View>
-          </View>
-
-          {/* Toujours visible, pour le chauffeur comme pour le passager : les deux
-              suivent la même course et ont besoin des deux distances. */}
-          <View style={styles.focusRow}>
-            {(
-              [
-                { key: 'pickup' as const, label: 'Chauffeur → passager', Icon: MapPin },
-                { key: 'destination' as const, label: 'Vers la destination', Icon: Flag },
-              ]
-            ).map((option) => {
-              const usable = option.key === 'pickup' || !!dropoff;
-              const on = focus === option.key && usable;
-
-              return (
-                <Pressable
-                  key={option.key}
-                  accessibilityRole="button"
-                  accessibilityState={{ selected: on, disabled: !usable }}
-                  disabled={!usable}
-                  onPress={() => setFocus(option.key)}
-                  style={({ pressed }) => [
-                    styles.focusOption,
-                    on && styles.focusOptionActive,
-                    !usable && styles.focusOptionDisabled,
-                    pressed && styles.pressed,
-                  ]}>
-                  <option.Icon
-                    size={14}
-                    color={on ? colors.accent : usable ? colors.textSecondary : colors.textMuted}
-                  />
-                  <Text
-                    style={[
-                      styles.focusLabel,
-                      on && styles.focusLabelActive,
-                      !usable && styles.focusLabelDisabled,
-                    ]}>
-                    {option.label}
-                  </Text>
-                </Pressable>
-              );
-            })}
-          </View>
-
-          {!dropoff ? (
-            <Text style={styles.meta}>
-              Aucune destination n&apos;était choisie au moment de la demande : seule la distance
-              entre le chauffeur et le passager est suivie.
-            </Text>
-          ) : null}
-
-          {vehicleType ? (
-            <View style={styles.vehicleRow}>
-              <CarFront size={16} color={colors.textSecondary} />
-              <Text style={styles.vehicleLabel}>
-                {vehicleType.label}
-                {ride.vehicle?.plate ? ` · ${ride.vehicle.plate}` : ''}
-              </Text>
-            </View>
-          ) : null}
-
-          {route ? (
-            <>
-              <View style={styles.stats}>
-                <View style={styles.stat}>
-                  <RouteIcon size={16} color={colors.textSecondary} />
-                  <Text style={styles.statValue}>{formatDistance(route.distanceM / 1000)}</Text>
-                  <Text style={styles.statLabel}>
-                    {onCourse ? 'de course' : 'jusqu’au passager'}
-                  </Text>
-                </View>
-                <View style={styles.statDivider} />
-                <View style={styles.stat}>
-                  <Clock size={16} color={colors.textSecondary} />
-                  <Text style={styles.statValue}>{formatDuration(route.durationS)}</Text>
-                  <Text style={styles.statLabel}>{onCourse ? 'de trajet' : 'avant l’arrivée'}</Text>
-                </View>
-                {fare != null ? (
-                  <>
-                    <View style={styles.statDivider} />
-                    <View style={styles.stat}>
-                      <Wallet size={16} color={colors.textSecondary} />
-                      <Text style={[styles.statValue, styles.fareValue]}>{formatXaf(fare)}</Text>
-                      <Text style={styles.statLabel}>estimation</Text>
-                    </View>
-                  </>
-                ) : null}
-              </View>
-
-              {onCourse && fare != null ? (
-                <Text style={styles.meta}>
-                  {`Tarif ${vehicleType?.tariffClass ?? 'Éco'} estimé avant course : l’attente et les détours réels ne sont pas comptés.`}
-                </Text>
-              ) : null}
-
-              {onCourse && fare == null ? (
-                <Text style={styles.meta}>
-                  Aucun véhicule n&apos;est encore associé à cette course : le tarif sera estimé
-                  dès qu&apos;un chauffeur l&apos;aura acceptée.
-                </Text>
-              ) : null}
-            </>
-          ) : active && ride.status !== 'requested' ? (
-            <Text style={styles.meta}>
-              En attente de la position du chauffeur — elle arrive dès qu&apos;il ouvre
-              l&apos;application.
-            </Text>
-          ) : ride.canRespond && !geo.position ? (
-            <Text style={styles.meta}>
-              Active ta localisation pour mesurer le trajet avant de répondre.
-            </Text>
-          ) : null}
-
-          {ride.status === 'requested' ? (
-            <Text style={styles.meta}>
-              {ride.canRespond
-                ? 'Regarde le trajet, puis accepte ou refuse cette demande.'
-                : ride.asDriver
-                  ? 'Réponds à la demande depuis la discussion.'
-                  : 'En attente de la réponse du chauffeur.'}
-            </Text>
-          ) : null}
-
-          {/* Le chauffeur sollicité tranche ici, une fois le trajet consulté. */}
-          {ride.canRespond ? (
-            <View style={styles.actions}>
-              <Pressable
-                accessibilityRole="button"
-                disabled={busy}
-                onPress={() =>
-                  void run(
-                    () => respond({ rideId: ride.id, accept: true }),
-                    'acceptation impossible',
-                  )
-                }
-                style={({ pressed }) => [styles.primary, pressed && styles.pressed]}>
-                <Text style={styles.primaryLabel}>Accepter la course</Text>
-              </Pressable>
-              <Pressable
-                accessibilityRole="button"
-                disabled={busy}
-                onPress={() =>
-                  void run(() => respond({ rideId: ride.id, accept: false }), 'refus impossible')
-                }
-                style={({ pressed }) => [styles.danger, pressed && styles.pressed]}>
-                <Text style={styles.dangerLabel}>Refuser</Text>
-              </Pressable>
-            </View>
-          ) : null}
-
-          {/* Le reçu se voit des deux côtés ; le formulaire n'est que pour le
-              passager, qui doit régler avant de clore — `complete` le lui refuse sinon. */}
-          {ride.payment ? (
-            <RidePayment
-              amount={ride.payment.amount}
-              driverPhone={ride.driverPhone}
-              driverName={ride.driverName ?? 'ton chauffeur'}
-              paid={ride.payment}
-              busy={false}
-              onPay={() => undefined}
-            />
-          ) : !ride.asDriver && active && ride.status !== 'requested' ? (
-            fare != null ? (
-              <RidePayment
-                amount={fare}
-                driverPhone={ride.driverPhone}
-                driverName={ride.driverName ?? 'ton chauffeur'}
-                paid={null}
-                busy={busy}
-                onPay={(method: PaymentMethod) =>
-                  void run(
-                    () => pay({ rideId: ride.id, method, amount: fare }),
-                    'paiement impossible',
-                  )
-                }
-              />
+            {expanded ? (
+              <ChevronDown size={20} color={colors.textSecondary} />
             ) : (
+              <ChevronUp size={20} color={colors.textSecondary} />
+            )}
+          </Pressable>
+
+          {!expanded ? null : (
+            <>
+            {/* Toujours visible, pour le chauffeur comme pour le passager : les deux
+                suivent la même course et ont besoin des deux distances. */}
+            <View style={styles.focusRow}>
+              {(
+                [
+                  { key: 'pickup' as const, label: 'Chauffeur → passager', Icon: MapPin },
+                  { key: 'destination' as const, label: 'Vers la destination', Icon: Flag },
+                ]
+              ).map((option) => {
+                const usable = option.key === 'pickup' || !!dropoff;
+                const on = focus === option.key && usable;
+
+                return (
+                  <Pressable
+                    key={option.key}
+                    accessibilityRole="button"
+                    accessibilityState={{ selected: on, disabled: !usable }}
+                    disabled={!usable}
+                    onPress={() => setFocus(option.key)}
+                    style={({ pressed }) => [
+                      styles.focusOption,
+                      on && styles.focusOptionActive,
+                      !usable && styles.focusOptionDisabled,
+                      pressed && styles.pressed,
+                    ]}>
+                    <option.Icon
+                      size={14}
+                      color={on ? colors.accent : usable ? colors.textSecondary : colors.textMuted}
+                    />
+                    <Text
+                      style={[
+                        styles.focusLabel,
+                        on && styles.focusLabelActive,
+                        !usable && styles.focusLabelDisabled,
+                      ]}>
+                      {option.label}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+
+            {!dropoff ? (
               <Text style={styles.meta}>
-                Bascule sur « Vers la destination » pour connaître le montant et régler la course.
+                Aucune destination n&apos;était choisie au moment de la demande : seule la distance
+                entre le chauffeur et le passager est suivie.
               </Text>
-            )
-          ) : null}
+            ) : null}
 
-          {ride.status === 'completed' && !ride.asDriver ? (
-            <View style={styles.rating}>
-              <Text style={styles.ratingTitle}>
-                {ride.rating != null
-                  ? `Tu as noté ${ride.driverName ?? 'ce chauffeur'}`
-                  : `Comment s'est passée la course avec ${ride.driverName ?? 'ton chauffeur'} ?`}
+            {/* La jonction remplace le bouton « Démarrer » sans le supprimer :
+                l'un des deux peut toujours trancher à la main. */}
+            {active && ride.status === 'matched' ? (
+              <Text style={styles.meta}>
+                {`La course démarrera d’elle-même dès que vous serez à moins de ${JOIN_RADIUS_M} m l’un de l’autre.`}
               </Text>
+            ) : null}
 
-              <View style={styles.stars}>
-                <StarRating
-                  value={ride.rating ?? draftRating}
-                  onChange={ride.rating == null ? setDraftRating : undefined}
-                  disabled={ride.rating != null || busy}
-                />
+            {ride.joinedAt ? (
+              <Text style={styles.meta}>
+                Vous roulez ensemble vers la destination : vos deux téléphones tiennent la position
+                à jour, chacun une fois par minute.
+              </Text>
+            ) : null}
+
+            {vehicleType ? (
+              <View style={styles.vehicleRow}>
+                <CarFront size={16} color={colors.textSecondary} />
+                <Text style={styles.vehicleLabel}>
+                  {vehicleType.label}
+                  {ride.vehicle?.plate ? ` · ${ride.vehicle.plate}` : ''}
+                </Text>
               </View>
+            ) : null}
 
-              {ride.rating == null ? (
+            {route ? (
+              <>
+                <View style={styles.stats}>
+                  <View style={styles.stat}>
+                    <RouteIcon size={16} color={colors.textSecondary} />
+                    <Text style={styles.statValue}>{formatDistance(route.distanceM / 1000)}</Text>
+                    <Text style={styles.statLabel}>
+                      {onCourse ? 'de course' : 'jusqu’au passager'}
+                    </Text>
+                  </View>
+                  <View style={styles.statDivider} />
+                  <View style={styles.stat}>
+                    <Clock size={16} color={colors.textSecondary} />
+                    <Text style={styles.statValue}>{formatDuration(route.durationS)}</Text>
+                    <Text style={styles.statLabel}>{onCourse ? 'de trajet' : 'avant l’arrivée'}</Text>
+                  </View>
+                  {fare != null ? (
+                    <>
+                      <View style={styles.statDivider} />
+                      <View style={styles.stat}>
+                        <Wallet size={16} color={colors.textSecondary} />
+                        <Text style={[styles.statValue, styles.fareValue]}>{formatXaf(fare)}</Text>
+                        <Text style={styles.statLabel}>estimation</Text>
+                      </View>
+                    </>
+                  ) : null}
+                </View>
+
+                {onCourse && fare != null ? (
+                  <Text style={styles.meta}>
+                    {`Tarif ${vehicleType?.tariffClass ?? 'Éco'} estimé avant course : l’attente et les détours réels ne sont pas comptés.`}
+                  </Text>
+                ) : null}
+
+                {onCourse && fare == null ? (
+                  <Text style={styles.meta}>
+                    Aucun véhicule n&apos;est encore associé à cette course : le tarif sera estimé
+                    dès qu&apos;un chauffeur l&apos;aura acceptée.
+                  </Text>
+                ) : null}
+              </>
+            ) : active && ride.status !== 'requested' ? (
+              <Text style={styles.meta}>
+                En attente de la position du chauffeur — elle arrive dès qu&apos;il ouvre
+                l&apos;application.
+              </Text>
+            ) : ride.canRespond && !geo.position ? (
+              <Text style={styles.meta}>
+                Active ta localisation pour mesurer le trajet avant de répondre.
+              </Text>
+            ) : null}
+
+            {ride.status === 'requested' ? (
+              <Text style={styles.meta}>
+                {ride.canRespond
+                  ? 'Regarde le trajet, puis accepte ou refuse cette demande.'
+                  : ride.asDriver
+                    ? 'Réponds à la demande depuis la discussion.'
+                    : 'En attente de la réponse du chauffeur.'}
+              </Text>
+            ) : null}
+
+            {/* Le chauffeur sollicité tranche ici, une fois le trajet consulté. */}
+            {ride.canRespond ? (
+              <View style={styles.actions}>
                 <Pressable
                   accessibilityRole="button"
-                  disabled={busy || draftRating <= 0}
+                  disabled={busy}
                   onPress={() =>
                     void run(
-                      () => rate({ rideId: ride.id, rating: draftRating }),
-                      'notation impossible',
+                      () => respond({ rideId: ride.id, accept: true }),
+                      'acceptation impossible',
                     )
+                  }
+                  style={({ pressed }) => [styles.primary, pressed && styles.pressed]}>
+                  <Text style={styles.primaryLabel}>Accepter la course</Text>
+                </Pressable>
+                <Pressable
+                  accessibilityRole="button"
+                  disabled={busy}
+                  onPress={() =>
+                    void run(() => respond({ rideId: ride.id, accept: false }), 'refus impossible')
+                  }
+                  style={({ pressed }) => [styles.danger, pressed && styles.pressed]}>
+                  <Text style={styles.dangerLabel}>Refuser</Text>
+                </Pressable>
+              </View>
+            ) : null}
+
+            {/* Covoiturage : ouvert dès que la course est engagée et qu'elle mène
+                quelque part. Le chauffeur sollicité, lui, tranche d'abord. */}
+            {active && !ride.canRespond ? (
+              <SharedRide
+                state={sharing}
+                splits={splits}
+                asDriver={ride.asDriver}
+                shareable={!!dropoff}
+                routeKm={onCourse && route ? route.distanceM / 1000 : null}
+                searchDelayMs={SHARE_SEARCH_DELAY_MS}
+                busy={busy}
+                onToggle={toggleSharing}
+                onBoard={markBoarded}
+                onDrop={markDropped}
+              />
+            ) : null}
+
+            {/* Le reçu se voit des deux côtés ; le formulaire n'est que pour le
+                passager, qui doit régler avant de clore — `complete` le lui refuse sinon. */}
+            {ride.payment ? (
+              <RidePayment
+                amount={ride.payment.amount}
+                driverPhone={ride.driverPhone}
+                driverName={ride.driverName ?? 'ton chauffeur'}
+                paid={ride.payment}
+                busy={false}
+                onPay={() => undefined}
+              />
+            ) : !ride.asDriver && active && ride.status !== 'requested' ? (
+              payable != null ? (
+                <RidePayment
+                  amount={payable}
+                  driverPhone={ride.driverPhone}
+                  driverName={ride.driverName ?? 'ton chauffeur'}
+                  paid={null}
+                  busy={busy}
+                  onPay={(method: PaymentMethod) =>
+                    void run(
+                      () => pay({ rideId: ride.id, method, amount: payable }),
+                      'paiement impossible',
+                    )
+                  }
+                />
+              ) : (
+                <Text style={styles.meta}>
+                  Bascule sur « Vers la destination » pour connaître le montant et régler la course.
+                </Text>
+              )
+            ) : null}
+
+            {ride.status === 'completed' && !ride.asDriver ? (
+              <View style={styles.rating}>
+                <Text style={styles.ratingTitle}>
+                  {ride.rating != null
+                    ? `Tu as noté ${ride.driverName ?? 'ce chauffeur'}`
+                    : `Comment s'est passée la course avec ${ride.driverName ?? 'ton chauffeur'} ?`}
+                </Text>
+
+                <View style={styles.stars}>
+                  <StarRating
+                    value={ride.rating ?? draftRating}
+                    onChange={ride.rating == null ? setDraftRating : undefined}
+                    disabled={ride.rating != null || busy}
+                  />
+                </View>
+
+                {ride.rating == null ? (
+                  <Pressable
+                    accessibilityRole="button"
+                    disabled={busy || draftRating <= 0}
+                    onPress={() =>
+                      void run(
+                        () => rate({ rideId: ride.id, rating: draftRating }),
+                        'notation impossible',
+                      )
+                    }
+                    style={({ pressed }) => [
+                      styles.primary,
+                      draftRating <= 0 && styles.primaryDisabled,
+                      pressed && styles.pressed,
+                    ]}>
+                    <Text
+                      style={[
+                        styles.primaryLabel,
+                        draftRating <= 0 && styles.primaryLabelDisabled,
+                      ]}>
+                      {draftRating > 0
+                        ? `Envoyer ${draftRating.toFixed(1).replace('.', ',')} / 5`
+                        : 'Choisis une note'}
+                    </Text>
+                  </Pressable>
+                ) : (
+                  <Text style={[styles.meta, styles.ratingTitle]}>
+                    {`Note enregistrée : ${ride.rating.toFixed(1).replace('.', ',')} / 5. Elle compte dans la moyenne du chauffeur.`}
+                  </Text>
+                )}
+              </View>
+            ) : null}
+
+            <View style={styles.actions}>
+              {ride.conversationId ? (
+                <Pressable
+                  accessibilityRole="button"
+                  onPress={() => router.push('/messages')}
+                  style={({ pressed }) => [styles.ghost, pressed && styles.pressed]}>
+                  <MessageSquare size={16} color={colors.text} />
+                  <Text style={styles.ghostLabel}>Discussion</Text>
+                </Pressable>
+              ) : null}
+
+              {ride.asDriver && !ride.canRespond && ride.status === 'matched' ? (
+                <Pressable
+                  accessibilityRole="button"
+                  disabled={busy}
+                  onPress={() =>
+                    void run(() => start({ rideId: ride.id }), 'démarrage impossible')
+                  }
+                  style={({ pressed }) => [styles.primary, pressed && styles.pressed]}>
+                  <Text style={styles.primaryLabel}>Démarrer la course</Text>
+                </Pressable>
+              ) : null}
+
+              {/* Ouvert aux deux parties dès que la course existe : celui qui
+                  constate la fin du trajet le premier peut clore. */}
+              {active && !ride.canRespond ? (
+                <Pressable
+                  accessibilityRole="button"
+                  disabled={busy || (!ride.asDriver && !ride.payment)}
+                  onPress={() =>
+                    void run(() => complete({ rideId: ride.id }), 'clôture impossible')
                   }
                   style={({ pressed }) => [
                     styles.primary,
-                    draftRating <= 0 && styles.primaryDisabled,
+                    !ride.asDriver && !ride.payment && styles.primaryDisabled,
                     pressed && styles.pressed,
                   ]}>
                   <Text
                     style={[
                       styles.primaryLabel,
-                      draftRating <= 0 && styles.primaryLabelDisabled,
+                      !ride.asDriver && !ride.payment && styles.primaryLabelDisabled,
                     ]}>
-                    {draftRating > 0
-                      ? `Envoyer ${draftRating.toFixed(1).replace('.', ',')} / 5`
-                      : 'Choisis une note'}
+                    {!ride.asDriver && !ride.payment
+                      ? 'Règle la course pour la terminer'
+                      : 'Terminer la course'}
                   </Text>
                 </Pressable>
-              ) : (
-                <Text style={[styles.meta, styles.ratingTitle]}>
-                  {`Note enregistrée : ${ride.rating.toFixed(1).replace('.', ',')} / 5. Elle compte dans la moyenne du chauffeur.`}
-                </Text>
-              )}
+              ) : null}
+
+              {active && !ride.canRespond ? (
+                <Pressable
+                  accessibilityRole="button"
+                  disabled={busy}
+                  onPress={askCancel}
+                  style={({ pressed }) => [styles.danger, pressed && styles.pressed]}>
+                  <Text style={styles.dangerLabel}>Annuler</Text>
+                </Pressable>
+              ) : null}
             </View>
-          ) : null}
-
-          <View style={styles.actions}>
-            {ride.conversationId ? (
-              <Pressable
-                accessibilityRole="button"
-                onPress={() => router.push('/messages')}
-                style={({ pressed }) => [styles.ghost, pressed && styles.pressed]}>
-                <MessageSquare size={16} color={colors.text} />
-                <Text style={styles.ghostLabel}>Discussion</Text>
-              </Pressable>
-            ) : null}
-
-            {ride.asDriver && !ride.canRespond && ride.status === 'matched' ? (
-              <Pressable
-                accessibilityRole="button"
-                disabled={busy}
-                onPress={() =>
-                  void run(() => start({ rideId: ride.id }), 'démarrage impossible')
-                }
-                style={({ pressed }) => [styles.primary, pressed && styles.pressed]}>
-                <Text style={styles.primaryLabel}>Démarrer la course</Text>
-              </Pressable>
-            ) : null}
-
-            {/* Ouvert aux deux parties dès que la course existe : celui qui
-                constate la fin du trajet le premier peut clore. */}
-            {active && !ride.canRespond ? (
-              <Pressable
-                accessibilityRole="button"
-                disabled={busy || (!ride.asDriver && !ride.payment)}
-                onPress={() =>
-                  void run(() => complete({ rideId: ride.id }), 'clôture impossible')
-                }
-                style={({ pressed }) => [
-                  styles.primary,
-                  !ride.asDriver && !ride.payment && styles.primaryDisabled,
-                  pressed && styles.pressed,
-                ]}>
-                <Text
-                  style={[
-                    styles.primaryLabel,
-                    !ride.asDriver && !ride.payment && styles.primaryLabelDisabled,
-                  ]}>
-                  {!ride.asDriver && !ride.payment
-                    ? 'Règle la course pour la terminer'
-                    : 'Terminer la course'}
-                </Text>
-              </Pressable>
-            ) : null}
-
-            {active && !ride.canRespond ? (
-              <Pressable
-                accessibilityRole="button"
-                disabled={busy}
-                onPress={askCancel}
-                style={({ pressed }) => [styles.danger, pressed && styles.pressed]}>
-                <Text style={styles.dangerLabel}>Annuler</Text>
-              </Pressable>
-            ) : null}
-          </View>
-        </View>
+            </>
+          )}
+        </Animated.View>
       </View>
     </View>
   );
